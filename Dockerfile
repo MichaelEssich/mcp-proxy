@@ -37,10 +37,11 @@ USER proxyuser
 EXPOSE 8000
 
 # Set default environment variables
-ENV PROXY_HOST=0.0.0.0 \
+# BEARER_TOKEN intentionally has no default; the app will refuse to start
+# without one. Set it at runtime via environment or .env file.
+ENV PROXY_HOST=127.0.0.1 \
     PROXY_PORT=8000 \
     TARGET_MCP_URL=http://localhost:8080 \
-    BEARER_TOKEN=changeme \
     DEBUG=false
 
 # Run the application

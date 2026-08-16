@@ -28,7 +28,7 @@ Create a `.env` file or set environment variables:
 
 ```bash
 # Proxy server configuration
-PROXY_HOST=0.0.0.0
+PROXY_HOST=127.0.0.1
 PROXY_PORT=8000
 
 # Target MCP server configuration
@@ -112,7 +112,7 @@ Set environment variables in the `docker-compose.yml` file or via a `.env` file.
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `PROXY_HOST` | Host to bind the proxy server | `0.0.0.0` | No |
+| `PROXY_HOST` | Host to bind the proxy server | `127.0.0.1` | No |
 | `PROXY_PORT` | Port to bind the proxy server | `8000` | No |
 | `TARGET_MCP_URL` | URL of the target MCP server | `http://localhost:8080` | No |
 | `TARGET_TIMEOUT` | Request timeout to target server (seconds) | `30` | No |

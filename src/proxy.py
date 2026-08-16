@@ -8,18 +8,16 @@ to a target MCP server with bearer token authentication.
 import hmac
 import logging
 import re
-from typing import Optional, AsyncGenerator, Dict, Tuple
+from typing import Optional, AsyncGenerator, Dict, Tuple, Callable
 from fastapi import FastAPI, Request, Response, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-from urllib.parse import urljoin
+import httpx2 as httpx
 
 # Rate limiting imports
 try:
     from slowapi import Limiter
-    from slowapi.util import get_remote_address
     from slowapi.errors import RateLimitExceeded
     from slowapi.middleware import SlowAPIMiddleware
     RATE_LIMITING_AVAILABLE = True
@@ -27,6 +25,7 @@ except ImportError:
     RATE_LIMITING_AVAILABLE = False
     Limiter = None
     SlowAPIMiddleware = None
+    RateLimitExceeded = None
 
 from .config import get_config, ProxyConfig
 
@@ -34,6 +33,52 @@ logger = logging.getLogger(__name__)
 
 # Security scheme for bearer token authentication
 security = HTTPBearer()
+
+# Headers from upstream responses that must not be forwarded to clients
+_RESPONSE_HEADERS_TO_STRIP = {
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "server",
+    "x-powered-by",
+    "x-aspnet-version",
+    "x-debug",
+    "x-debug-info",
+    "x-runtime",
+    "via",
+}
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract the real client IP for rate-limit keying.
+
+    Priority chain:
+      1. ``CF-Connecting-IP`` -- set by Cloudflare (Tunnel or proxy), not
+         client-spoofable.  Use this when deployed behind Cloudflare.
+      2. Rightmost entry of ``X-Forwarded-For`` -- appended by the last
+         trusted reverse proxy (e.g. nginx with
+         ``proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for``).
+         The rightmost entry is the one added by the proxy itself, so it
+         cannot be forged by the client.
+      3. ``request.client.host`` -- the TCP peer address, used for direct
+         connections (development, testing, or no reverse proxy).
+    """
+    # 1. Cloudflare Tunnel / Cloudflare proxy sets this; it is not spoofable
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+
+    # 2. Rightmost X-Forwarded-For entry (set by the last trusted proxy)
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
+
+    # 3. Direct TCP connection
+    if request.client:
+        return request.client.host
+    return "unknown"
 
 
 class ProxyClient:
@@ -73,8 +118,12 @@ class ProxyClient:
         Returns:
             Tuple of (status_code, response_headers, response_body_generator)
         """
-        # Build target URL
-        target_url = urljoin(self.config.TARGET_MCP_URL, path)
+        # Build target URL by appending the path to the base URL.
+        # We use explicit concatenation instead of urljoin because urljoin
+        # performs URL resolution — a path like "//evil.com" would be
+        # resolved to "http://evil.com", enabling SSRF.
+        safe_path = path.lstrip("/")
+        target_url = f"{self.config.TARGET_MCP_URL}/{safe_path}"
         
         # Filter out headers that shouldn't be forwarded
         filtered_headers = self._filter_headers(headers)
@@ -89,19 +138,23 @@ class ProxyClient:
         )
         
         try:
-            # Send request and get response
-            response = await self.client.send(request)
-            
+            # Send request with stream=True so the upstream response is
+            # streamed incrementally rather than buffered entirely in memory.
+            response = await self.client.send(request, stream=True)
+
             async def response_body_generator() -> AsyncGenerator[bytes, None]:
                 """Generator for streaming response body."""
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-            
+                try:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+                finally:
+                    await response.aclose()
+
             # Convert response headers to dict
             response_headers = dict(response.headers)
-            
+
             return response.status_code, response_headers, response_body_generator()
-            
+
         except httpx.TimeoutException as e:
             logger.error(f"Request timeout to {target_url}: {e}")  # Internal logging only
             raise HTTPException(
@@ -140,6 +193,9 @@ class ProxyClient:
             "x-forwarded-for", # Prevent IP forwarding (handle separately if needed)
             "x-real-ip",       # Prevent IP forwarding
             "via",             # Prevent proxy chain disclosure
+            "proxy-authorization",  # Prevent credential leakage
+            "cookie",          # Prevent cookie/session leakage
+            "set-cookie",      # Prevent cookie/session leakage
         }
         
         filtered = {}
@@ -181,11 +237,20 @@ class MCPProxyApp:
         self.proxy_client = ProxyClient(config)
     
     def _setup_cors(self):
-        """Setup CORS middleware."""
+        """Setup CORS middleware.
+
+        ``allow_credentials=True`` with ``allow_origins=["*"]`` is invalid per
+        the CORS spec and causes Starlette to reflect any Origin back, allowing
+        any website to make credentialed cross-origin requests. When origins
+        are wildcarded we disable credentials; users who need credentials must
+        set ``ALLOWED_ORIGINS`` to specific domains.
+        """
+        origins = self.config.allowed_origins_list
+        is_wildcard = "*" in origins
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=self.config.allowed_origins_list,
-            allow_credentials=True,
+            allow_origins=origins,
+            allow_credentials=not is_wildcard,
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -201,13 +266,26 @@ class MCPProxyApp:
             # Validate path characters (alphanumeric, hyphen, underscore, slash, dot)
             if not re.match(r'^[a-zA-Z0-9\-_.~\/]+$', path):
                 raise HTTPException(status_code=400, detail="Invalid path characters")
-            return await call_next(request)
+            response = await call_next(request)
+            # Add security response headers
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["X-XSS-Protection"] = "0"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+            return response
     
     def _setup_rate_limiting(self):
-        """Setup rate limiting if slowapi is available."""
+        """Setup rate limiting if slowapi is available.
+
+        Uses ``_get_client_ip`` which resolves the real client IP from
+        ``CF-Connecting-IP`` (Cloudflare), then the rightmost
+        ``X-Forwarded-For`` entry (nginx), then the TCP peer.  This prevents
+        clients from spoofing ``X-Forwarded-For`` to bypass per-client limits.
+        """
         if RATE_LIMITING_AVAILABLE:
             self.limiter = Limiter(
-                key_func=get_remote_address,
+                key_func=_get_client_ip,
                 default_limits=["100/minute"]
             )
             self.app.state.limiter = self.limiter
@@ -222,9 +300,10 @@ class MCPProxyApp:
     def _setup_routes(self):
         """Setup API routes."""
         # Main proxy endpoint - catches all paths
+        # TRACE is excluded to prevent Cross-Site Tracing (XST) attacks
         @self.app.api_route(
             f"{self.config.PROXY_PREFIX}/{{path:path}}",
-            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"],
+            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
         )
         async def proxy_endpoint(
             request: Request,
@@ -240,15 +319,50 @@ class MCPProxyApp:
             # Validate bearer token
             self._validate_bearer_token(credentials)
             
+            # Enforce maximum request body size.
+            # We check Content-Length when present (fast path) AND read the
+            # body incrementally so that chunked transfer encoding (which has
+            # no Content-Length) cannot bypass the limit.
+            content_length = request.headers.get("content-length")
+            if content_length:
+                try:
+                    cl = int(content_length)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid Content-Length header"
+                    )
+                if cl < 0:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid Content-Length header"
+                    )
+                if cl > self.config.MAX_REQUEST_SIZE:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                        detail="Request body exceeds maximum allowed size"
+                    )
+
             # Extract request information
             method = request.method
             headers = dict(request.headers)
             query_params = dict(request.query_params)
-            
-            # Read request body if present
+
+            # Read request body if present, enforcing size limit for chunked
+            # transfers or mismatched Content-Length values.
             body = None
             if request.method in ["POST", "PUT", "PATCH"]:
-                body = await request.body()
+                body_chunks = []
+                total = 0
+                async for chunk in request.stream():
+                    total += len(chunk)
+                    if total > self.config.MAX_REQUEST_SIZE:
+                        raise HTTPException(
+                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                            detail="Request body exceeds maximum allowed size"
+                        )
+                    body_chunks.append(chunk)
+                body = b"".join(body_chunks) if body_chunks else b""
             
             # Forward request to target server
             status_code, response_headers, response_body = await self.proxy_client.forward_request(
@@ -293,17 +407,14 @@ class MCPProxyApp:
         return True
     
     def _filter_response_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
-        """Filter response headers before sending to client."""
-        # Headers to potentially filter
-        headers_to_filter = {
-            "transfer-encoding",
-            "connection",
-            "keep-alive",
-        }
-        
+        """Filter response headers before sending to client.
+
+        Strips hop-by-hop headers as well as headers that leak information
+        about the upstream server (type, version, framework, debug info).
+        """
         filtered = {}
         for key, value in headers.items():
-            if key.lower() not in headers_to_filter:
+            if key.lower() not in _RESPONSE_HEADERS_TO_STRIP:
                 filtered[key] = value
         
         return filtered

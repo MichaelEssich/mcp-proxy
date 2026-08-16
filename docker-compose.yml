@@ -5,17 +5,17 @@ services:
       dockerfile: Dockerfile
     container_name: mcp-proxy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       # Proxy configuration
-      - PROXY_HOST=0.0.0.0
+      - PROXY_HOST=127.0.0.1
       - PROXY_PORT=8000
       
       # Target MCP server configuration
       - TARGET_MCP_URL=http://your-mcp-server-image:8080
       
-      # Authentication configuration
-      - BEARER_TOKEN=${BEARER_TOKEN:-your-secret-token}
+      # Authentication configuration (required - no default token for security)
+      - BEARER_TOKEN=${BEARER_TOKEN:?BEARER_TOKEN environment variable is required}
       - AUTH_HEADER_NAME=Authorization
       
       # Optional settings

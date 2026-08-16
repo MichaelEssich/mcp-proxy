@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 import sys
-import httpx
+import httpx2 as httpx
 import uvicorn
 from fastapi import FastAPI, Request
 

@@ -11,7 +11,7 @@ class ProxyConfig(BaseSettings):
     """Proxy server configuration."""
     
     # Proxy server settings
-    PROXY_HOST: str = "0.0.0.0"
+    PROXY_HOST: str = "127.0.0.1"
     PROXY_PORT: int = 8000
     DEBUG: bool = False
     
