@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "mcp-proxy"
 version = "1.0.0"
 description = "MCP Proxy Server - Secure MCP HTTP endpoints with bearer token authentication"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi==0.139.2",
     "uvicorn[standard]==0.51.0",

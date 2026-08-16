@@ -135,18 +135,20 @@ def main():
     
     args = parser.parse_args()
     
-    # Set environment file if specified
-    if args.config and args.config != ".env":
-        os.environ["ENV_FILE"] = args.config
-    
     # Override debug from command line
     if args.debug:
         os.environ["DEBUG"] = "true"
+    
+    # Load configuration with the specified env file.
+    # ProxyConfig is constructed here (not at import time) so that the
+    # --config flag actually takes effect.
+    config = ProxyConfig(_env_file=args.config)
     
     # Run the server
     asyncio.run(run_server(
         host=args.host,
         port=args.port,
+        config=config,
         reload=args.reload
     ))
 

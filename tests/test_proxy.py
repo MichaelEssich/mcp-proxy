@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from src.config import ProxyConfig
-from src.proxy import MCPProxyApp, ProxyClient, create_proxy_app
+from src.proxy import MCPProxyApp, ProxyClient, create_proxy_app, _resolve_client_ip
 
 
 @pytest.fixture
@@ -120,7 +120,6 @@ class TestProxyClient:
             "Via": "1.1 proxy",
             "Proxy-Authorization": "Basic dXNlcjpwYXNz",
             "Cookie": "session=abc123",
-            "Set-Cookie": "session=abc123",
             "X-Custom-Header": "value"
         }
         
@@ -136,7 +135,6 @@ class TestProxyClient:
         assert "Via" not in filtered  # Now filtered for security
         assert "Proxy-Authorization" not in filtered  # Prevent credential leakage
         assert "Cookie" not in filtered  # Prevent session leakage
-        assert "Set-Cookie" not in filtered  # Prevent session leakage
         assert "X-Custom-Header" in filtered
 
 
@@ -206,7 +204,7 @@ class TestConfiguration:
     
     def test_default_config(self):
         """Test default configuration values."""
-        config = ProxyConfig()
+        config = ProxyConfig(BEARER_TOKEN="test")
         assert config.PROXY_HOST == "127.0.0.1"
         assert config.PROXY_PORT == 8000
         assert config.TARGET_MCP_URL == "http://localhost:8080"
@@ -214,23 +212,36 @@ class TestConfiguration:
     def test_config_validation(self):
         """Test configuration validation."""
         # Test trailing slash removal from target URL
-        config = ProxyConfig(TARGET_MCP_URL="http://localhost:8080/")
+        config = ProxyConfig(BEARER_TOKEN="test", TARGET_MCP_URL="http://localhost:8080/")
         assert config.TARGET_MCP_URL == "http://localhost:8080"
         
         # Test proxy prefix normalization
-        config = ProxyConfig(PROXY_PREFIX="/api/mcp/")
+        config = ProxyConfig(BEARER_TOKEN="test", PROXY_PREFIX="/api/mcp/")
         assert config.PROXY_PREFIX == "/api/mcp"
         
-        config = ProxyConfig(PROXY_PREFIX="api/mcp")
+        config = ProxyConfig(BEARER_TOKEN="test", PROXY_PREFIX="api/mcp")
         assert config.PROXY_PREFIX == "/api/mcp"
     
     def test_allowed_origins_parsing(self):
         """Test allowed origins parsing."""
-        config = ProxyConfig(ALLOWED_ORIGINS="http://localhost:3000,https://app.example.com")
+        config = ProxyConfig(BEARER_TOKEN="test", ALLOWED_ORIGINS="http://localhost:3000,https://app.example.com")
         assert config.allowed_origins_list == ["http://localhost:3000", "https://app.example.com"]
         
-        config = ProxyConfig(ALLOWED_ORIGINS="*")
+        config = ProxyConfig(BEARER_TOKEN="test", ALLOWED_ORIGINS="*")
         assert config.allowed_origins_list == ["*"]
+
+    def test_trusted_proxies_parsing(self):
+        """Test trusted proxies parsing."""
+        config = ProxyConfig(BEARER_TOKEN="test")
+        assert config.trusted_proxies_list == []
+
+        config = ProxyConfig(BEARER_TOKEN="test", TRUSTED_PROXIES="172.16.0.0/12, 10.0.0.0/8")
+        assert config.trusted_proxies_list == ["172.16.0.0/12", "10.0.0.0/8"]
+
+    def test_response_size_default(self):
+        """Test that MAX_RESPONSE_SIZE has a default value."""
+        config = ProxyConfig(BEARER_TOKEN="test")
+        assert config.MAX_RESPONSE_SIZE == 50_000_000
 
 
 class TestProxyAppCreation:
@@ -304,11 +315,10 @@ class TestRequestSizeLimit:
 
 
 class TestClientIPExtraction:
-    """Tests for _get_client_ip used by the rate limiter."""
+    """Tests for _resolve_client_ip used by the rate limiter."""
 
     def test_prefers_cf_connecting_ip(self):
-        """Test that CF-Connecting-IP takes priority over everything."""
-        from src.proxy import _get_client_ip
+        """Test that CF-Connecting-IP takes priority when peer is trusted (loopback)."""
         from starlette.requests import Request
 
         scope = {
@@ -323,11 +333,10 @@ class TestClientIPExtraction:
             "client": ("127.0.0.1", 12345),
         }
         request = Request(scope)
-        assert _get_client_ip(request) == "203.0.113.50"
+        assert _resolve_client_ip(request, []) == "203.0.113.50"
 
     def test_uses_rightmost_x_forwarded_for(self):
-        """Test that the rightmost X-Forwarded-For entry is used (set by the last trusted proxy)."""
-        from src.proxy import _get_client_ip
+        """Test that the rightmost X-Forwarded-For entry is used when peer is trusted."""
         from starlette.requests import Request
 
         scope = {
@@ -341,11 +350,10 @@ class TestClientIPExtraction:
             "client": ("127.0.0.1", 12345),
         }
         request = Request(scope)
-        assert _get_client_ip(request) == "10.0.0.1"
+        assert _resolve_client_ip(request, []) == "10.0.0.1"
 
     def test_ignores_spoofed_leftmost_x_forwarded_for(self):
         """Test that a client-spoofed leftmost X-Forwarded-For entry is not used."""
-        from src.proxy import _get_client_ip
         from starlette.requests import Request
 
         scope = {
@@ -359,11 +367,10 @@ class TestClientIPExtraction:
             "client": ("127.0.0.1", 12345),
         }
         request = Request(scope)
-        assert _get_client_ip(request) == "10.0.0.2"
+        assert _resolve_client_ip(request, []) == "10.0.0.2"
 
     def test_falls_back_to_client_host(self):
         """Test that the TCP peer is used when no proxy headers are present."""
-        from src.proxy import _get_client_ip
         from starlette.requests import Request
 
         scope = {
@@ -375,7 +382,69 @@ class TestClientIPExtraction:
             "client": ("127.0.0.1", 12345),
         }
         request = Request(scope)
-        assert _get_client_ip(request) == "127.0.0.1"
+        assert _resolve_client_ip(request, []) == "127.0.0.1"
+
+    def test_untrusted_peer_ignores_forwarded_headers(self):
+        """Test that a direct (untrusted) peer's forwarded headers are ignored."""
+        from starlette.requests import Request
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/test",
+            "headers": [
+                (b"cf-connecting-ip", b"1.2.3.4"),
+                (b"x-forwarded-for", b"5.6.7.8, 9.10.11.12"),
+            ],
+            "query_string": b"",
+            "client": ("203.0.113.99", 12345),
+        }
+        request = Request(scope)
+        # No trusted networks configured, peer is not loopback
+        assert _resolve_client_ip(request, []) == "203.0.113.99"
+
+    def test_trusted_docker_network_peer(self):
+        """Test that a Docker network peer in TRUSTED_PROXIES is trusted."""
+        from starlette.requests import Request
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/test",
+            "headers": [
+                (b"cf-connecting-ip", b"198.51.100.1"),
+            ],
+            "query_string": b"",
+            "client": ("172.17.0.3", 12345),
+        }
+        request = Request(scope)
+        trusted = MCPProxyApp._parse_trusted_networks("172.16.0.0/12")
+        assert _resolve_client_ip(request, trusted) == "198.51.100.1"
+
+    def test_ipv6_loopback_trusted(self):
+        """Test that IPv6 loopback (::1) is trusted."""
+        from starlette.requests import Request
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/test",
+            "headers": [
+                (b"cf-connecting-ip", b"2001:db8::1"),
+            ],
+            "query_string": b"",
+            "client": ("::1", 12345),
+        }
+        request = Request(scope)
+        assert _resolve_client_ip(request, []) == "2001:db8::1"
+
+    def test_parse_trusted_networks_empty(self):
+        """Test that empty trusted proxies string returns empty list."""
+        assert MCPProxyApp._parse_trusted_networks("") == []
+
+    def test_parse_trusted_networks_invalid(self):
+        """Test that invalid entries are skipped with a warning."""
+        assert MCPProxyApp._parse_trusted_networks("not-an-ip") == []
 
 
 class TestRateLimiting:
@@ -384,7 +453,7 @@ class TestRateLimiting:
     @pytest.mark.asyncio
     async def test_rate_limiting_enabled(self, mock_config):
         """Test that rate limiting is enabled and configured with defaults."""
-        from src.proxy import RATE_LIMITING_AVAILABLE, _get_client_ip
+        from src.proxy import RATE_LIMITING_AVAILABLE
         
         # Rate limiting should be available since slowapi is in requirements
         assert RATE_LIMITING_AVAILABLE is True
@@ -395,9 +464,6 @@ class TestRateLimiting:
         # Check that limiter is set up
         assert hasattr(app, 'limiter')
         assert app.limiter is not None
-        
-        # Check that key function is our X-Forwarded-For-aware function
-        assert app.limiter._key_func == _get_client_ip
         
         # Check that default limits are configured (they're LimitGroup objects, not strings)
         assert len(app.limiter._default_limits) > 0
@@ -422,15 +488,30 @@ class TestRateLimiting:
     
     def test_rate_limit_config_values(self, mock_config):
         """Test the rate limiting configuration values."""
-        from src.proxy import MCPProxyApp, _get_client_ip
+        from src.proxy import MCPProxyApp
         
         app = MCPProxyApp(mock_config)
         
         # Verify limiter is created with correct settings
         assert app.limiter is not None
-        assert app.limiter._key_func == _get_client_ip
         # Default limits should have at least one LimitGroup
         assert len(app.limiter._default_limits) > 0
+
+    def test_trusted_networks_from_config(self, mock_config):
+        """Test that trusted_networks is parsed from config."""
+        from src.proxy import MCPProxyApp
+        
+        # Empty config = no trusted networks (only loopback trusted at runtime)
+        app = MCPProxyApp(mock_config)
+        assert app.trusted_networks == []
+
+        # Config with TRUSTED_PROXIES
+        config = ProxyConfig(
+            BEARER_TOKEN="test",
+            TRUSTED_PROXIES="172.16.0.0/12, 10.0.0.0/8"
+        )
+        app2 = MCPProxyApp(config)
+        assert len(app2.trusted_networks) == 2
 
 
 class TestHeaderFiltering:
@@ -473,3 +554,88 @@ class TestHeaderFiltering:
         assert "X-Debug" not in filtered
         assert "Via" not in filtered
         assert "X-Custom-Header" in filtered
+
+    def test_filter_response_headers_strips_set_cookie(self, proxy_app):
+        """Test that Set-Cookie headers from upstream are not forwarded to clients."""
+        headers = {
+            "Content-Type": "application/json",
+            "Set-Cookie": "session=abc123; HttpOnly",
+            "X-Custom-Header": "value"
+        }
+        
+        filtered = proxy_app._filter_response_headers(headers)
+        
+        assert "Content-Type" in filtered
+        assert "Set-Cookie" not in filtered
+        assert "X-Custom-Header" in filtered
+
+    def test_filter_response_headers_strips_cors(self, proxy_app):
+        """Test that upstream CORS headers are stripped to prevent policy bypass."""
+        headers = {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "X-Custom",
+            "Access-Control-Max-Age": "3600",
+            "X-Custom-Header": "value"
+        }
+        
+        filtered = proxy_app._filter_response_headers(headers)
+        
+        assert "Content-Type" in filtered
+        assert "Access-Control-Allow-Origin" not in filtered
+        assert "Access-Control-Allow-Credentials" not in filtered
+        assert "Access-Control-Allow-Methods" not in filtered
+        assert "Access-Control-Allow-Headers" not in filtered
+        assert "Access-Control-Expose-Headers" not in filtered
+        assert "Access-Control-Max-Age" not in filtered
+        assert "X-Custom-Header" in filtered
+
+
+class TestResponseSizeLimit:
+    """Tests for MAX_RESPONSE_SIZE enforcement."""
+
+    @pytest.mark.asyncio
+    async def test_response_body_generator_truncates_oversized(self, mock_config):
+        """Test that response streaming stops when MAX_RESPONSE_SIZE is exceeded."""
+        config = ProxyConfig(
+            BEARER_TOKEN="test",
+            TARGET_MCP_URL="http://mock:8080",
+            MAX_RESPONSE_SIZE=100,
+        )
+        client = ProxyClient(config)
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/octet-stream"}
+        mock_response.aclose = AsyncMock()
+
+        # Generate 10 chunks of 20 bytes each (200 bytes total, limit is 100)
+        async def mock_aiter_bytes():
+            for _ in range(10):
+                yield b"x" * 20
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+
+        with patch.object(client.client, 'send', new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = mock_response
+
+            status_code, headers, body_gen = await client.forward_request(
+                method="GET",
+                path="/big",
+                headers={},
+                body=None,
+            )
+
+            # Consume the generator
+            chunks = []
+            async for chunk in body_gen:
+                chunks.append(chunk)
+
+            # Should have received only 5 chunks (100 bytes) before stopping
+            total_bytes = sum(len(c) for c in chunks)
+            assert total_bytes <= 100
+            # Response should be closed after truncation
+            mock_response.aclose.assert_awaited()

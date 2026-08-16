@@ -6,6 +6,7 @@ to a target MCP server with bearer token authentication.
 """
 
 import hmac
+import ipaddress
 import logging
 import re
 from typing import Optional, AsyncGenerator, Dict, Tuple, Callable
@@ -46,39 +47,61 @@ _RESPONSE_HEADERS_TO_STRIP = {
     "x-debug-info",
     "x-runtime",
     "via",
+    "set-cookie",
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-expose-headers",
+    "access-control-max-age",
 }
 
 
-def _get_client_ip(request: Request) -> str:
+def _resolve_client_ip(request: Request, trusted_networks: list) -> str:
     """Extract the real client IP for rate-limit keying.
 
-    Priority chain:
-      1. ``CF-Connecting-IP`` -- set by Cloudflare (Tunnel or proxy), not
-         client-spoofable.  Use this when deployed behind Cloudflare.
+    Forwarded headers (``CF-Connecting-IP``, ``X-Forwarded-For``) are only
+    consulted when the TCP peer is a trusted proxy — loopback by default,
+    plus any CIDRs in ``TRUSTED_PROXIES``.  Direct (untrusted) connections
+    use the TCP peer address, preventing header spoofing to bypass rate
+    limits when the origin is exposed.
+
+    Priority chain when the peer is trusted:
+      1. ``CF-Connecting-IP`` -- set by Cloudflare (Tunnel or proxy).
       2. Rightmost entry of ``X-Forwarded-For`` -- appended by the last
          trusted reverse proxy (e.g. nginx with
          ``proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for``).
-         The rightmost entry is the one added by the proxy itself, so it
-         cannot be forged by the client.
-      3. ``request.client.host`` -- the TCP peer address, used for direct
-         connections (development, testing, or no reverse proxy).
+      3. ``request.client.host`` -- the TCP peer address.
     """
-    # 1. Cloudflare Tunnel / Cloudflare proxy sets this; it is not spoofable
-    cf_ip = request.headers.get("cf-connecting-ip")
-    if cf_ip:
-        return cf_ip.strip()
+    peer = request.client.host if request.client else None
 
-    # 2. Rightmost X-Forwarded-For entry (set by the last trusted proxy)
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
-        if parts:
-            return parts[-1]
+    def _is_trusted(ip_str: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if ip.is_loopback:
+            return True
+        for net in trusted_networks:
+            if ip in net:
+                return True
+        return False
 
-    # 3. Direct TCP connection
-    if request.client:
-        return request.client.host
-    return "unknown"
+    if peer and _is_trusted(peer):
+        # 1. Cloudflare Tunnel / Cloudflare proxy sets this
+        cf_ip = request.headers.get("cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.strip()
+
+        # 2. Rightmost X-Forwarded-For entry (set by the last trusted proxy)
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
+
+    # 3. Direct TCP connection (or untrusted peer)
+    return peer or "unknown"
 
 
 class ProxyClient:
@@ -145,7 +168,15 @@ class ProxyClient:
             async def response_body_generator() -> AsyncGenerator[bytes, None]:
                 """Generator for streaming response body."""
                 try:
+                    total = 0
                     async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > self.config.MAX_RESPONSE_SIZE:
+                            logger.error(
+                                f"Response body exceeded maximum size "
+                                f"({self.config.MAX_RESPONSE_SIZE} bytes) for path: {path}"
+                            )
+                            break
                         yield chunk
                 finally:
                     await response.aclose()
@@ -195,7 +226,6 @@ class ProxyClient:
             "via",             # Prevent proxy chain disclosure
             "proxy-authorization",  # Prevent credential leakage
             "cookie",          # Prevent cookie/session leakage
-            "set-cookie",      # Prevent cookie/session leakage
         }
         
         filtered = {}
@@ -211,6 +241,7 @@ class MCPProxyApp:
     
     def __init__(self, config: ProxyConfig):
         self.config = config
+        self.trusted_networks = self._parse_trusted_networks(config.TRUSTED_PROXIES)
         self.app = FastAPI(
             debug=config.DEBUG,
             title="MCP Proxy Server",
@@ -278,14 +309,21 @@ class MCPProxyApp:
     def _setup_rate_limiting(self):
         """Setup rate limiting if slowapi is available.
 
-        Uses ``_get_client_ip`` which resolves the real client IP from
+        Uses ``_resolve_client_ip`` which resolves the real client IP from
         ``CF-Connecting-IP`` (Cloudflare), then the rightmost
-        ``X-Forwarded-For`` entry (nginx), then the TCP peer.  This prevents
-        clients from spoofing ``X-Forwarded-For`` to bypass per-client limits.
+        ``X-Forwarded-For`` entry (nginx), then the TCP peer.  Forwarded
+        headers are only trusted when the TCP peer is loopback or in the
+        configured ``TRUSTED_PROXIES`` list, preventing clients from
+        spoofing headers to bypass per-client limits.
         """
         if RATE_LIMITING_AVAILABLE:
+            trusted_networks = self.trusted_networks
+
+            def get_client_ip(request: Request) -> str:
+                return _resolve_client_ip(request, trusted_networks)
+
             self.limiter = Limiter(
-                key_func=_get_client_ip,
+                key_func=get_client_ip,
                 default_limits=["100/minute"]
             )
             self.app.state.limiter = self.limiter
@@ -296,7 +334,23 @@ class MCPProxyApp:
             # Add rate limiting middleware
             if SlowAPIMiddleware:
                 self.app.add_middleware(SlowAPIMiddleware)
-    
+
+    @staticmethod
+    def _parse_trusted_networks(trusted_proxies: str) -> list:
+        """Parse comma-separated IPs/CIDRs into ip_network objects."""
+        networks = []
+        if not trusted_proxies:
+            return networks
+        for entry in trusted_proxies.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                logger.warning(f"Invalid trusted proxy entry: {entry}")
+        return networks
+
     def _setup_routes(self):
         """Setup API routes."""
         # Main proxy endpoint - catches all paths

@@ -2,7 +2,7 @@
 Configuration management for MCP Proxy Server.
 """
 
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 
@@ -31,6 +31,8 @@ class ProxyConfig(BaseSettings):
     
     # Security settings
     MAX_REQUEST_SIZE: int = 10_000_000  # 10MB - More reasonable limit to prevent memory exhaustion
+    MAX_RESPONSE_SIZE: int = 50_000_000  # 50MB - Cap upstream responses to prevent memory/bandwidth exhaustion
+    TRUSTED_PROXIES: str = ""  # Comma-separated IPs/CIDRs allowed to set forwarded headers (e.g. "172.16.0.0/12")
     
     @property
     def allowed_origins_list(self) -> List[str]:
@@ -38,6 +40,13 @@ class ProxyConfig(BaseSettings):
         if self.ALLOWED_ORIGINS == "*":
             return ["*"]
         return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def trusted_proxies_list(self) -> List[str]:
+        """Parse trusted proxies string to list."""
+        if not self.TRUSTED_PROXIES:
+            return []
+        return [entry.strip() for entry in self.TRUSTED_PROXIES.split(",") if entry.strip()]
     
     @field_validator('TARGET_MCP_URL', mode='before')
     @classmethod
@@ -66,10 +75,13 @@ class ProxyConfig(BaseSettings):
     }
 
 
-# Global configuration instance
-config = ProxyConfig()
+# Global configuration instance (lazy-loaded so CLI args can be applied first)
+_config: Optional[ProxyConfig] = None
 
 
 def get_config() -> ProxyConfig:
-    """Get the global configuration instance."""
-    return config
+    """Get the global configuration instance (lazy-loaded on first call)."""
+    global _config
+    if _config is None:
+        _config = ProxyConfig()
+    return _config
