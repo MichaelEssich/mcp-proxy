@@ -122,6 +122,10 @@ Set environment variables in the `docker-compose.yml` file or via a `.env` file.
 | `ALLOWED_ORIGINS` | CORS allowed origins (comma-separated or `*`) | `*` | No |
 | `PROXY_PREFIX` | URL prefix for all proxy routes | `""` (empty) | No |
 | `MAX_REQUEST_SIZE` | Maximum request body size (bytes) | `10000000` (10MB) | No |
+| `MAX_RESPONSE_SIZE` | Maximum upstream response size (bytes) | `50000000` (50MB) | No |
+| `MAX_CONCURRENT_REQUESTS` | Max in-flight proxied requests | `50` | No |
+| `TRUSTED_PROXIES` | Trusted reverse proxy IPs/CIDRs (comma-separated) | `""` (loopback only) | No |
+| `REAL_IP_HEADER` | Header for real client IP (`cf-connecting-ip` for Cloudflare, `""` for nginx/X-Forwarded-For) | `cf-connecting-ip` | No |
 
 ## Architecture
 
@@ -157,6 +161,18 @@ Client → [Bearer Token Auth] → MCP Proxy → Target MCP Server
    - `Host`, `Content-Length`, `Transfer-Encoding`
 7. **SSRF Protection**: HTTP redirects are disabled to prevent Server-Side Request Forgery
 8. **Request Size Limit**: Default 10MB limit prevents memory exhaustion attacks
+9. **Response Size Limit**: Upstream responses are capped at 50MB; oversized responses are rejected with 413
+10. **Concurrency Limiting**: In-flight proxied requests are capped (default 50) to bound memory usage
+11. **Custom Auth Header**: `AUTH_HEADER_NAME` controls which header the token is read from (standard `Authorization: Bearer` or a custom header like `X-Api-Key`)
+12. **Rate-Limit Integrity**: The real client IP is resolved from `REAL_IP_HEADER` (default `cf-connecting-ip` for Cloudflare) or the rightmost `X-Forwarded-For` entry. Set `REAL_IP_HEADER=""` for nginx to avoid trusting client-spoofed `CF-Connecting-IP` headers
+
+## Deployment Notes
+
+### Cloudflare Tunnel (default)
+The proxy is secure out of the box. `REAL_IP_HEADER` defaults to `cf-connecting-ip`, which Cloudflare overwrites with the true client IP. No additional configuration needed.
+
+### nginx Proxy Manager
+Set `REAL_IP_HEADER=""` (empty) so the proxy uses the rightmost `X-Forwarded-For` entry, which nginx appends to and clients cannot forge on the right. Also set `TRUSTED_PROXIES` to your nginx peer's CIDR (e.g. `172.16.0.0/12` for Docker). Otherwise the proxy will not trust forwarded headers from nginx.
 
 ## License
 

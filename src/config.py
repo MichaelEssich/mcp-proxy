@@ -32,7 +32,9 @@ class ProxyConfig(BaseSettings):
     # Security settings
     MAX_REQUEST_SIZE: int = 10_000_000  # 10MB - More reasonable limit to prevent memory exhaustion
     MAX_RESPONSE_SIZE: int = 50_000_000  # 50MB - Cap upstream responses to prevent memory/bandwidth exhaustion
+    MAX_CONCURRENT_REQUESTS: int = 50  # Max in-flight proxied requests (bounds memory: limit x MAX_REQUEST_SIZE)
     TRUSTED_PROXIES: str = ""  # Comma-separated IPs/CIDRs allowed to set forwarded headers (e.g. "172.16.0.0/12")
+    REAL_IP_HEADER: str = "cf-connecting-ip"  # Header to trust for the real client IP when behind a reverse proxy. "cf-connecting-ip" (Cloudflare, default) or "x-forwarded-for" (nginx); empty = rightmost X-Forwarded-For
     
     @property
     def allowed_origins_list(self) -> List[str]:

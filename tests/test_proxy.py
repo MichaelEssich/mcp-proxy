@@ -178,25 +178,20 @@ class TestMCPProxyApp:
     
     def test_bearer_token_validation(self, mock_config, proxy_app):
         """Test bearer token validation."""
-        from fastapi.security import HTTPAuthorizationCredentials
-        
         # Test valid token
-        credentials = HTTPAuthorizationCredentials(
-            scheme="Bearer",
-            credentials="test-token-123"
-        )
-        assert proxy_app._validate_bearer_token(credentials) is True
-        
+        assert proxy_app._validate_bearer_token("test-token-123") is True
+
         # Test invalid token
-        credentials = HTTPAuthorizationCredentials(
-            scheme="Bearer",
-            credentials="wrong-token"
-        )
-        
         with pytest.raises(Exception) as exc_info:
-            proxy_app._validate_bearer_token(credentials)
-        
+            proxy_app._validate_bearer_token("wrong-token")
+
         assert "403" in str(exc_info.value) or "Invalid" in str(exc_info.value)
+
+        # Test missing token
+        with pytest.raises(Exception) as exc_info:
+            proxy_app._validate_bearer_token(None)
+
+        assert "401" in str(exc_info.value)
 
 
 class TestConfiguration:
@@ -318,7 +313,7 @@ class TestClientIPExtraction:
     """Tests for _resolve_client_ip used by the rate limiter."""
 
     def test_prefers_cf_connecting_ip(self):
-        """Test that CF-Connecting-IP takes priority when peer is trusted (loopback)."""
+        """Test that CF-Connecting-IP takes priority when configured and peer is trusted (loopback)."""
         from starlette.requests import Request
 
         scope = {
@@ -333,7 +328,7 @@ class TestClientIPExtraction:
             "client": ("127.0.0.1", 12345),
         }
         request = Request(scope)
-        assert _resolve_client_ip(request, []) == "203.0.113.50"
+        assert _resolve_client_ip(request, [], "cf-connecting-ip") == "203.0.113.50"
 
     def test_uses_rightmost_x_forwarded_for(self):
         """Test that the rightmost X-Forwarded-For entry is used when peer is trusted."""
@@ -419,7 +414,7 @@ class TestClientIPExtraction:
         }
         request = Request(scope)
         trusted = MCPProxyApp._parse_trusted_networks("172.16.0.0/12")
-        assert _resolve_client_ip(request, trusted) == "198.51.100.1"
+        assert _resolve_client_ip(request, trusted, "cf-connecting-ip") == "198.51.100.1"
 
     def test_ipv6_loopback_trusted(self):
         """Test that IPv6 loopback (::1) is trusted."""
@@ -436,7 +431,7 @@ class TestClientIPExtraction:
             "client": ("::1", 12345),
         }
         request = Request(scope)
-        assert _resolve_client_ip(request, []) == "2001:db8::1"
+        assert _resolve_client_ip(request, [], "cf-connecting-ip") == "2001:db8::1"
 
     def test_parse_trusted_networks_empty(self):
         """Test that empty trusted proxies string returns empty list."""
@@ -599,7 +594,8 @@ class TestResponseSizeLimit:
 
     @pytest.mark.asyncio
     async def test_response_body_generator_truncates_oversized(self, mock_config):
-        """Test that response streaming stops when MAX_RESPONSE_SIZE is exceeded."""
+        """Test that response streaming aborts when MAX_RESPONSE_SIZE is exceeded."""
+        import httpx2 as httpx
         config = ProxyConfig(
             BEARER_TOKEN="test",
             TARGET_MCP_URL="http://mock:8080",
@@ -609,6 +605,7 @@ class TestResponseSizeLimit:
 
         mock_response = MagicMock()
         mock_response.status_code = 200
+        # No content-length header -> exercises the chunked-stream guard
         mock_response.headers = {"content-type": "application/octet-stream"}
         mock_response.aclose = AsyncMock()
 
@@ -629,13 +626,158 @@ class TestResponseSizeLimit:
                 body=None,
             )
 
-            # Consume the generator
+            # Consuming the generator should raise once the limit is hit
             chunks = []
-            async for chunk in body_gen:
-                chunks.append(chunk)
+            with pytest.raises(httpx.StreamError):
+                async for chunk in body_gen:
+                    chunks.append(chunk)
 
-            # Should have received only 5 chunks (100 bytes) before stopping
+            # Should have received only 5 chunks (100 bytes) before aborting
             total_bytes = sum(len(c) for c in chunks)
             assert total_bytes <= 100
-            # Response should be closed after truncation
+            # Response should be closed after abort
             mock_response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_oversized_upstream_content_length_rejected(self, mock_config):
+        """Test that upstream Content-Length > MAX_RESPONSE_SIZE is rejected with 413."""
+        config = ProxyConfig(
+            BEARER_TOKEN="test",
+            TARGET_MCP_URL="http://mock:8080",
+            MAX_RESPONSE_SIZE=100,
+        )
+        client = ProxyClient(config)
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/octet-stream", "content-length": "9999"}
+        mock_response.aclose = AsyncMock()
+
+        with patch.object(client.client, 'send', new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = mock_response
+
+            with pytest.raises(Exception) as exc_info:
+                await client.forward_request(
+                    method="GET",
+                    path="/big",
+                    headers={},
+                    body=None,
+                )
+            assert "413" in str(exc_info.value)
+            mock_response.aclose.assert_awaited()
+
+
+class TestCustomAuthHeader:
+    """Tests for AUTH_HEADER_NAME controlling which header is read for auth."""
+
+    def test_custom_auth_header_name(self):
+        """Test that a custom AUTH_HEADER_NAME is read for auth."""
+        config = ProxyConfig(
+            BEARER_TOKEN="my-secret",
+            AUTH_HEADER_NAME="X-Api-Key",
+        )
+        app = MCPProxyApp(config)
+
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"x-api-key", b"my-secret")],
+            "client": ("127.0.0.1", 12345),
+        }
+        token = app._extract_token(Request(scope))
+        assert token == "my-secret"
+        assert app._validate_bearer_token(token) is True
+
+    def test_custom_auth_header_ignored_when_standard_used(self):
+        """Test that Authorization header is not read when AUTH_HEADER_NAME is custom."""
+        config = ProxyConfig(
+            BEARER_TOKEN="my-secret",
+            AUTH_HEADER_NAME="X-Api-Key",
+        )
+        app = MCPProxyApp(config)
+
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"authorization", b"Bearer my-secret")],
+            "client": ("127.0.0.1", 12345),
+        }
+        token = app._extract_token(Request(scope))
+        assert token is None
+
+    def test_standard_auth_header_still_works(self, mock_config):
+        """Test that the default Authorization: Bearer header works."""
+        app = MCPProxyApp(mock_config)
+
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"authorization", b"Bearer test-token-123")],
+            "client": ("127.0.0.1", 12345),
+        }
+        token = app._extract_token(Request(scope))
+        assert token == "test-token-123"
+
+    def test_malformed_bearer_returns_none(self, mock_config):
+        """Test that a malformed Bearer header returns None (-> 401)."""
+        app = MCPProxyApp(mock_config)
+
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"authorization", b"Basic dXNlcjpwYXNz")],
+            "client": ("127.0.0.1", 12345),
+        }
+        token = app._extract_token(Request(scope))
+        assert token is None
+
+
+class TestRealIpHeaderDefault:
+    """Tests for REAL_IP_HEADER default and nginx spoofing fix."""
+
+    def test_default_real_ip_header_is_cf(self):
+        """Test that REAL_IP_HEADER defaults to cf-connecting-ip."""
+        config = ProxyConfig(BEARER_TOKEN="test")
+        assert config.REAL_IP_HEADER == "cf-connecting-ip"
+
+    def test_nginx_spoofed_cf_connecting_ip_ignored(self):
+        """Test that spoofed CF-Connecting-IP is ignored when REAL_IP_HEADER is empty (nginx)."""
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [
+                (b"cf-connecting-ip", b"1.2.3.4"),
+                (b"x-forwarded-for", b"spoofed, 10.0.0.2"),
+            ],
+            "client": ("172.16.0.2", 12345),  # nginx peer, trusted
+        }
+        trusted = MCPProxyApp._parse_trusted_networks("172.16.0.0/12")
+        # With real_ip_header="" (nginx config), CF-Connecting-IP is NOT trusted;
+        # rightmost X-Forwarded-For (set by nginx) is used instead.
+        ip = _resolve_client_ip(Request(scope), trusted, "")
+        assert ip == "10.0.0.2"
+
+    def test_real_ip_header_empty_uses_xff(self):
+        """Test that empty REAL_IP_HEADER falls back to rightmost X-Forwarded-For."""
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"x-forwarded-for", b"203.0.113.50, 10.0.0.1")],
+            "client": ("127.0.0.1", 12345),
+        }
+        assert _resolve_client_ip(Request(scope), [], "") == "10.0.0.1"
+
+
+class TestConcurrencyLimit:
+    """Tests for MAX_CONCURRENT_REQUESTS semaphore."""
+
+    def test_concurrency_semaphore_created(self):
+        """Test that the concurrency semaphore is initialized."""
+        config = ProxyConfig(BEARER_TOKEN="test", MAX_CONCURRENT_REQUESTS=5)
+        app = MCPProxyApp(config)
+        assert app._concurrency_sem._value == 5
+
+    def test_default_concurrency_limit(self):
+        """Test that the default concurrency limit is 50."""
+        config = ProxyConfig(BEARER_TOKEN="test")
+        assert config.MAX_CONCURRENT_REQUESTS == 50

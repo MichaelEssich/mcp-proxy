@@ -22,6 +22,11 @@ services:
       - DEBUG=${DEBUG:-false}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
       - PROXY_PREFIX=${PROXY_PREFIX:-}
+      # Trusted reverse proxy CIDRs (e.g. nginx Docker network "172.16.0.0/12")
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      # Real client IP header: "cf-connecting-ip" (Cloudflare, default) or "" for nginx (X-Forwarded-For)
+      - REAL_IP_HEADER=${REAL_IP_HEADER:-cf-connecting-ip}
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-50}
     restart: unless-stopped
 
   # Example of how to run an MCP server alongside the proxy

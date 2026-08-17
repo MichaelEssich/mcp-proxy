@@ -5,13 +5,13 @@ This module implements the core proxy functionality that forwards HTTP requests
 to a target MCP server with bearer token authentication.
 """
 
+import asyncio
 import hmac
 import ipaddress
 import logging
 import re
-from typing import Optional, AsyncGenerator, Dict, Tuple, Callable
-from fastapi import FastAPI, Request, Response, HTTPException, status, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from typing import Optional, AsyncGenerator, Dict, Tuple
+from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx2 as httpx
@@ -32,9 +32,6 @@ from .config import get_config, ProxyConfig
 
 logger = logging.getLogger(__name__)
 
-# Security scheme for bearer token authentication
-security = HTTPBearer()
-
 # Headers from upstream responses that must not be forwarded to clients
 _RESPONSE_HEADERS_TO_STRIP = {
     "transfer-encoding",
@@ -54,23 +51,34 @@ _RESPONSE_HEADERS_TO_STRIP = {
     "access-control-allow-headers",
     "access-control-expose-headers",
     "access-control-max-age",
+    # We stream decoded bytes (aiter_bytes handles gzip/deflate/brotli/zstd),
+    # so the upstream content-encoding/content-length no longer match the body
+    # we send. Let StreamingResponse recompute framing.
+    "content-encoding",
+    "content-length",
 }
 
 
-def _resolve_client_ip(request: Request, trusted_networks: list) -> str:
+def _resolve_client_ip(request: Request, trusted_networks: list, real_ip_header: str = "") -> str:
     """Extract the real client IP for rate-limit keying.
 
-    Forwarded headers (``CF-Connecting-IP``, ``X-Forwarded-For``) are only
-    consulted when the TCP peer is a trusted proxy — loopback by default,
-    plus any CIDRs in ``TRUSTED_PROXIES``.  Direct (untrusted) connections
-    use the TCP peer address, preventing header spoofing to bypass rate
-    limits when the origin is exposed.
+    Forwarded headers are only consulted when the TCP peer is trusted —
+    loopback by default, plus any CIDRs in ``TRUSTED_PROXIES``.  Direct
+    (untrusted) connections use the TCP peer address, preventing header
+    spoofing to bypass rate limits when the origin is exposed.
 
-    Priority chain when the peer is trusted:
-      1. ``CF-Connecting-IP`` -- set by Cloudflare (Tunnel or proxy).
+    When the peer is trusted, the resolution order is:
+
+      1. ``real_ip_header`` -- the operator-configured header (e.g.
+         ``cf-connecting-ip`` for Cloudflare Tunnel, which Cloudflare
+         overwrites with the true client IP). Only one named header is
+         trusted, so an attacker behind a different reverse proxy cannot
+         rotate it at will.
       2. Rightmost entry of ``X-Forwarded-For`` -- appended by the last
          trusted reverse proxy (e.g. nginx with
          ``proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for``).
+         The rightmost entry is set by the trusted proxy and cannot be
+         forged by the client.
       3. ``request.client.host`` -- the TCP peer address.
     """
     peer = request.client.host if request.client else None
@@ -88,10 +96,13 @@ def _resolve_client_ip(request: Request, trusted_networks: list) -> str:
         return False
 
     if peer and _is_trusted(peer):
-        # 1. Cloudflare Tunnel / Cloudflare proxy sets this
-        cf_ip = request.headers.get("cf-connecting-ip")
-        if cf_ip:
-            return cf_ip.strip()
+        # 1. Operator-configured real-IP header (Cloudflare overwrites
+        #    cf-connecting-ip; nginx operators should set "" to fall back
+        #    to X-Forwarded-For below).
+        if real_ip_header:
+            real_ip = request.headers.get(real_ip_header)
+            if real_ip:
+                return real_ip.strip()
 
         # 2. Rightmost X-Forwarded-For entry (set by the last trusted proxy)
         forwarded_for = request.headers.get("x-forwarded-for")
@@ -165,6 +176,26 @@ class ProxyClient:
             # streamed incrementally rather than buffered entirely in memory.
             response = await self.client.send(request, stream=True)
 
+            # Fast path: reject oversized responses before streaming begins.
+            # This covers the common case where upstream advertises a
+            # Content-Length. We still guard chunked streams below.
+            upstream_cl = response.headers.get("content-length")
+            if upstream_cl:
+                try:
+                    cl_val = int(upstream_cl)
+                except ValueError:
+                    cl_val = -1
+                if cl_val > self.config.MAX_RESPONSE_SIZE:
+                    await response.aclose()
+                    logger.error(
+                        f"Upstream Content-Length ({cl_val}) exceeds maximum "
+                        f"({self.config.MAX_RESPONSE_SIZE}) for path: {path}"
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                        detail="Upstream response exceeds maximum allowed size"
+                    )
+
             async def response_body_generator() -> AsyncGenerator[bytes, None]:
                 """Generator for streaming response body."""
                 try:
@@ -172,11 +203,14 @@ class ProxyClient:
                     async for chunk in response.aiter_bytes():
                         total += len(chunk)
                         if total > self.config.MAX_RESPONSE_SIZE:
+                            # Chunked stream with no Content-Length exceeded the
+                            # cap mid-stream. Abort rather than silently serving
+                            # a truncated body.
                             logger.error(
                                 f"Response body exceeded maximum size "
                                 f"({self.config.MAX_RESPONSE_SIZE} bytes) for path: {path}"
                             )
-                            break
+                            raise httpx.StreamError("Response size limit exceeded")
                         yield chunk
                 finally:
                     await response.aclose()
@@ -204,6 +238,9 @@ class ProxyClient:
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Bad gateway"  # Generic message
             )
+        except HTTPException:
+            # Re-raise HTTPExceptions (e.g. 413 from response size check) without wrapping
+            raise
         except Exception as e:
             logger.error(f"Unexpected error processing request to {target_url}: {e}")  # Internal logging only
             raise HTTPException(
@@ -242,6 +279,8 @@ class MCPProxyApp:
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.trusted_networks = self._parse_trusted_networks(config.TRUSTED_PROXIES)
+        self.real_ip_header = (config.REAL_IP_HEADER or "").lower()
+        self._concurrency_sem = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
         self.app = FastAPI(
             debug=config.DEBUG,
             title="MCP Proxy Server",
@@ -318,9 +357,10 @@ class MCPProxyApp:
         """
         if RATE_LIMITING_AVAILABLE:
             trusted_networks = self.trusted_networks
+            real_ip_header = self.real_ip_header
 
             def get_client_ip(request: Request) -> str:
-                return _resolve_client_ip(request, trusted_networks)
+                return _resolve_client_ip(request, trusted_networks, real_ip_header)
 
             self.limiter = Limiter(
                 key_func=get_client_ip,
@@ -362,7 +402,6 @@ class MCPProxyApp:
         async def proxy_endpoint(
             request: Request,
             path: str,
-            credentials: HTTPAuthorizationCredentials = Depends(security)
         ):
             """
             Proxy endpoint that forwards requests to the target MCP server.
@@ -370,9 +409,10 @@ class MCPProxyApp:
             This endpoint catches all HTTP methods and paths, validates the bearer token,
             and forwards the request to the configured MCP server.
             """
-            # Validate bearer token
-            self._validate_bearer_token(credentials)
-            
+            # Validate bearer token from the configured auth header
+            token = self._extract_token(request)
+            self._validate_bearer_token(token)
+
             # Enforce maximum request body size.
             # We check Content-Length when present (fast path) AND read the
             # body incrementally so that chunked transfer encoding (which has
@@ -417,19 +457,21 @@ class MCPProxyApp:
                         )
                     body_chunks.append(chunk)
                 body = b"".join(body_chunks) if body_chunks else b""
-            
-            # Forward request to target server
-            status_code, response_headers, response_body = await self.proxy_client.forward_request(
-                method=method,
-                path=path,
-                headers=headers,
-                body=body,
-                query_params=query_params if query_params else None
-            )
-            
+
+            # Bound concurrent in-flight proxied requests to prevent memory
+            # and upstream-connection exhaustion under load.
+            async with self._concurrency_sem:
+                status_code, response_headers, response_body = await self.proxy_client.forward_request(
+                    method=method,
+                    path=path,
+                    headers=headers,
+                    body=body,
+                    query_params=query_params if query_params else None
+                )
+
             # Remove headers that shouldn't be returned to client
             filtered_headers = self._filter_response_headers(response_headers)
-            
+
             # Stream the response back to the client
             return StreamingResponse(
                 content=response_body,
@@ -437,19 +479,37 @@ class MCPProxyApp:
                 headers=filtered_headers,
                 media_type=response_headers.get("content-type", "application/octet-stream")
             )
-        
-    def _validate_bearer_token(self, credentials: HTTPAuthorizationCredentials) -> bool:
+
+    def _extract_token(self, request: Request) -> Optional[str]:
+        """Extract the bearer token from the configured auth header.
+
+        For the standard ``Authorization`` header the ``Bearer`` scheme is
+        expected (``Authorization: Bearer <token>``). For a custom
+        ``AUTH_HEADER_NAME`` (e.g. ``X-Api-Key``) the raw header value is used.
+        Returns ``None`` if the header is missing or malformed.
+        """
+        header_name = self.config.AUTH_HEADER_NAME
+        raw = request.headers.get(header_name)
+        if not raw:
+            return None
+        raw = raw.strip()
+        if header_name.lower() == "authorization":
+            # Parse "Bearer <token>"
+            parts = raw.split(None, 1)
+            if len(parts) != 2 or parts[0].lower() != "bearer":
+                return None
+            return parts[1].strip()
+        return raw
+
+    def _validate_bearer_token(self, token: Optional[str]) -> bool:
         """Validate the bearer token from request credentials."""
-        if not credentials:
+        if not token:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing authorization header",
+                detail="Missing or malformed authorization header",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        
-        # Extract token from credentials
-        token = credentials.credentials
-        
+
         # Compare with configured token (constant-time comparison)
         if not hmac.compare_digest(token, self.config.BEARER_TOKEN):
             raise HTTPException(
@@ -457,7 +517,7 @@ class MCPProxyApp:
                 detail="Invalid or expired token",
                 headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
             )
-        
+
         return True
     
     def _filter_response_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
