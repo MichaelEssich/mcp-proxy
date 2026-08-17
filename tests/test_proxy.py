@@ -112,6 +112,10 @@ class TestProxyClient:
         headers = {
             "Host": "localhost",
             "Content-Length": "100",
+            "Transfer-Encoding": "chunked",
+            "Connection": "keep-alive",
+            "Keep-Alive": "timeout=30",
+            "Proxy-Connection": "keep-alive",
             "User-Agent": "test",
             "Authorization": "Bearer token",
             "Referer": "http://example.com",
@@ -127,6 +131,10 @@ class TestProxyClient:
         
         assert "Host" not in filtered
         assert "Content-Length" not in filtered
+        assert "Transfer-Encoding" not in filtered
+        assert "Connection" not in filtered  # Hop-by-hop (RFC 7230)
+        assert "Keep-Alive" not in filtered  # Hop-by-hop
+        assert "Proxy-Connection" not in filtered  # Non-standard hop-by-hop
         assert "Authorization" not in filtered
         assert "User-Agent" not in filtered  # Now filtered for security
         assert "Referer" not in filtered  # Now filtered for security
@@ -781,3 +789,141 @@ class TestConcurrencyLimit:
         """Test that the default concurrency limit is 50."""
         config = ProxyConfig(BEARER_TOKEN="test")
         assert config.MAX_CONCURRENT_REQUESTS == 50
+
+
+class TestBodyReadInsideSemaphore:
+    """Tests that request body buffering happens inside the concurrency semaphore."""
+
+    def test_body_read_under_semaphore_with_concurrency_limit(self):
+        """Verify that the body is read while the semaphore is held.
+
+        We set MAX_CONCURRENT_REQUESTS=1 and mock forward_request to record
+        whether the semaphore value dropped to 0 when it is called (meaning
+        the body has already been read inside the semaphore). If the body
+        were read before acquiring the semaphore, the semaphore would still
+        be at 1 during body read and only drop to 0 during forward_request.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        config = ProxyConfig(
+            BEARER_TOKEN="test",
+            MAX_CONCURRENT_REQUESTS=1,
+            MAX_REQUEST_SIZE=100000,
+        )
+        app = MCPProxyApp(config)
+        client = app.get_app()
+
+        sem_values_during_forward = []
+
+        async def mock_forward(*args, **kwargs):
+            sem_values_during_forward.append(app._concurrency_sem._value)
+            def body_gen():
+                yield b'{"ok": true}'
+            return (200, {"content-type": "application/json"}, body_gen())
+
+        with patch.object(app.proxy_client, 'forward_request', new_callable=AsyncMock) as mock:
+            mock.side_effect = mock_forward
+            from fastapi.testclient import TestClient
+            tc = TestClient(client)
+            response = tc.post(
+                "/test",
+                headers={"Authorization": "Bearer test"},
+                content=b"x" * 100,
+            )
+            assert response.status_code == 200
+            assert sem_values_during_forward == [0], (
+                "forward_request should run while the semaphore is held (value=0); "
+                f"got {sem_values_during_forward}"
+            )
+
+
+class TestRateLimitCORS:
+    """Tests that the rate-limit 429 response includes CORS headers."""
+
+    def test_429_includes_wildcard_cors_origin(self):
+        """When ALLOWED_ORIGINS=*, the 429 response should include
+        Access-Control-Allow-Origin: *."""
+        from slowapi.errors import RateLimitExceeded
+
+        config = ProxyConfig(
+            BEARER_TOKEN="test",
+            ALLOWED_ORIGINS="*",
+        )
+        app = MCPProxyApp(config)
+        fastapi_app = app.get_app()
+
+        # Find the registered RateLimitExceeded handler
+        handler = fastapi_app.exception_handlers.get(RateLimitExceeded)
+        assert handler is not None
+
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"origin", b"https://evil.com")],
+            "client": ("127.0.0.1", 12345),
+        }
+        response = handler(Request(scope), MagicMock())
+        assert response.status_code == 429
+        assert response.headers.get("access-control-allow-origin") == "*"
+
+    def test_429_includes_specific_cors_origin(self):
+        """When ALLOWED_ORIGINS is a specific list, the 429 response should
+        echo the Origin only if it is in the allowed list."""
+        from slowapi.errors import RateLimitExceeded
+
+        config = ProxyConfig(
+            BEARER_TOKEN="test",
+            ALLOWED_ORIGINS="https://app.example.com",
+        )
+        app = MCPProxyApp(config)
+        fastapi_app = app.get_app()
+
+        handler = fastapi_app.exception_handlers.get(RateLimitExceeded)
+        assert handler is not None
+
+        from starlette.requests import Request
+
+        # Matching origin
+        scope_ok = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"origin", b"https://app.example.com")],
+            "client": ("127.0.0.1", 12345),
+        }
+        response = handler(Request(scope_ok), MagicMock())
+        assert response.status_code == 429
+        assert response.headers.get("access-control-allow-origin") == "https://app.example.com"
+
+        # Non-matching origin
+        scope_bad = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"origin", b"https://evil.com")],
+            "client": ("127.0.0.1", 12345),
+        }
+        response2 = handler(Request(scope_bad), MagicMock())
+        assert response2.status_code == 429
+        assert response2.headers.get("access-control-allow-origin") is None
+
+    def test_429_no_origin_header(self):
+        """When no Origin header is present, no CORS headers are added."""
+        from slowapi.errors import RateLimitExceeded
+
+        config = ProxyConfig(
+            BEARER_TOKEN="test",
+            ALLOWED_ORIGINS="*",
+        )
+        app = MCPProxyApp(config)
+        fastapi_app = app.get_app()
+
+        handler = fastapi_app.exception_handlers.get(RateLimitExceeded)
+        assert handler is not None
+
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+        }
+        response = handler(Request(scope), MagicMock())
+        assert response.status_code == 429
+        assert response.headers.get("access-control-allow-origin") is None

@@ -197,7 +197,19 @@ class ProxyClient:
                     )
 
             async def response_body_generator() -> AsyncGenerator[bytes, None]:
-                """Generator for streaming response body."""
+                """Stream the upstream response body to the client.
+
+                If the body exceeds ``MAX_RESPONSE_SIZE`` mid-stream (only
+                possible with chunked transfer encoding -- responses with a
+                known Content-Length are rejected before streaming starts),
+                the generator raises ``httpx.StreamError``. Because the
+                status code and headers have already been sent, the proxy
+                cannot change the response status. Instead, the exception
+                propagates through ``StreamingResponse`` to uvicorn, which
+                closes the connection without sending a proper terminator.
+                Well-behaved HTTP clients detect this as an incomplete
+                response.
+                """
                 try:
                     total = 0
                     async for chunk in response.aiter_bytes():
@@ -255,13 +267,16 @@ class ProxyClient:
             "host",
             "content-length",
             "transfer-encoding",
+            "connection",          # Hop-by-hop (RFC 7230 §6.1)
+            "keep-alive",          # Hop-by-hop
+            "proxy-connection",    # Non-standard hop-by-hop
+            "proxy-authorization",  # Prevent credential leakage
             self.config.AUTH_HEADER_NAME.lower(),
             "user-agent",       # Prevent client identification
             "referer",         # Prevent referral information leak
             "x-forwarded-for", # Prevent IP forwarding (handle separately if needed)
             "x-real-ip",       # Prevent IP forwarding
             "via",             # Prevent proxy chain disclosure
-            "proxy-authorization",  # Prevent credential leakage
             "cookie",          # Prevent cookie/session leakage
         }
         
@@ -358,6 +373,8 @@ class MCPProxyApp:
         if RATE_LIMITING_AVAILABLE:
             trusted_networks = self.trusted_networks
             real_ip_header = self.real_ip_header
+            allowed_origins = self.config.allowed_origins_list
+            is_wildcard_origin = "*" in allowed_origins
 
             def get_client_ip(request: Request) -> str:
                 return _resolve_client_ip(request, trusted_networks, real_ip_header)
@@ -367,10 +384,28 @@ class MCPProxyApp:
                 default_limits=["100/minute"]
             )
             self.app.state.limiter = self.limiter
-            self.app.add_exception_handler(
-                RateLimitExceeded, 
-                lambda r, e: Response("Rate limit exceeded", status_code=429)
-            )
+
+            # SlowAPIMiddleware is the outermost user middleware, so it
+            # returns the 429 response directly to uvicorn -- bypassing
+            # CORSMiddleware (which is inner). The handler must therefore
+            # add CORS headers itself, otherwise browser clients get a CORS
+            # error instead of the rate-limit response.
+            def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> Response:
+                headers = {}
+                origin = request.headers.get("origin")
+                if origin:
+                    if is_wildcard_origin:
+                        headers["Access-Control-Allow-Origin"] = "*"
+                    elif origin in allowed_origins:
+                        headers["Access-Control-Allow-Origin"] = origin
+                        headers["Access-Control-Allow-Credentials"] = "true"
+                return Response(
+                    "Rate limit exceeded",
+                    status_code=429,
+                    headers=headers,
+                )
+
+            self.app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
             # Add rate limiting middleware
             if SlowAPIMiddleware:
                 self.app.add_middleware(SlowAPIMiddleware)
@@ -442,25 +477,30 @@ class MCPProxyApp:
             headers = dict(request.headers)
             query_params = dict(request.query_params)
 
-            # Read request body if present, enforcing size limit for chunked
-            # transfers or mismatched Content-Length values.
-            body = None
-            if request.method in ["POST", "PUT", "PATCH"]:
-                body_chunks = []
-                total = 0
-                async for chunk in request.stream():
-                    total += len(chunk)
-                    if total > self.config.MAX_REQUEST_SIZE:
-                        raise HTTPException(
-                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                            detail="Request body exceeds maximum allowed size"
-                        )
-                    body_chunks.append(chunk)
-                body = b"".join(body_chunks) if body_chunks else b""
-
-            # Bound concurrent in-flight proxied requests to prevent memory
-            # and upstream-connection exhaustion under load.
+            # Bound concurrent in-flight requests AND body buffering to prevent
+            # memory exhaustion under load. The body is read inside the
+            # semaphore so the worst-case memory bound is
+            # MAX_CONCURRENT_REQUESTS x MAX_REQUEST_SIZE. Reading the body
+            # before acquiring the semaphore would allow an attacker to open
+            # many concurrent connections and buffer large bodies outside the
+            # limit.
             async with self._concurrency_sem:
+                # Read request body if present, enforcing size limit for
+                # chunked transfers or mismatched Content-Length values.
+                body = None
+                if request.method in ["POST", "PUT", "PATCH"]:
+                    body_chunks = []
+                    total = 0
+                    async for chunk in request.stream():
+                        total += len(chunk)
+                        if total > self.config.MAX_REQUEST_SIZE:
+                            raise HTTPException(
+                                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                                detail="Request body exceeds maximum allowed size"
+                            )
+                        body_chunks.append(chunk)
+                    body = b"".join(body_chunks) if body_chunks else b""
+
                 status_code, response_headers, response_body = await self.proxy_client.forward_request(
                     method=method,
                     path=path,

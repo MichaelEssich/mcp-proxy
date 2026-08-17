@@ -169,7 +169,14 @@ Client → [Bearer Token Auth] → MCP Proxy → Target MCP Server
 ## Deployment Notes
 
 ### Cloudflare Tunnel (default)
-The proxy is secure out of the box. `REAL_IP_HEADER` defaults to `cf-connecting-ip`, which Cloudflare overwrites with the true client IP. No additional configuration needed.
+`REAL_IP_HEADER` defaults to `cf-connecting-ip`, which Cloudflare overwrites with the true client IP. **When cloudflared runs on the host** (connecting to the proxy via loopback/127.0.0.1), no additional configuration is needed.
+
+**When cloudflared runs in a separate container** (connecting over the Docker network), the proxy receives cloudflared's requests from a non-loopback IP (e.g. `172.x.x.x`). Since only loopback IPs are trusted by default, the proxy will ignore the `cf-connecting-ip` header and fall back to cloudflared's single container IP as the rate-limit key. This means all clients share one 100 req/min bucket and per-client rate limiting is effectively disabled. To fix this, set `TRUSTED_PROXIES` to the Docker network CIDR (e.g. `172.16.0.0/12`):
+
+```bash
+TRUSTED_PROXIES=172.16.0.0/12
+REAL_IP_HEADER=cf-connecting-ip
+```
 
 ### nginx Proxy Manager
 Set `REAL_IP_HEADER=""` (empty) so the proxy uses the rightmost `X-Forwarded-For` entry, which nginx appends to and clients cannot forge on the right. Also set `TRUSTED_PROXIES` to your nginx peer's CIDR (e.g. `172.16.0.0/12` for Docker). Otherwise the proxy will not trust forwarded headers from nginx.
