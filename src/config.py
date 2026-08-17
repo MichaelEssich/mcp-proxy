@@ -50,6 +50,17 @@ class ProxyConfig(BaseSettings):
             return []
         return [entry.strip() for entry in self.TRUSTED_PROXIES.split(",") if entry.strip()]
     
+    @field_validator('BEARER_TOKEN', mode='after')
+    @classmethod
+    def validate_bearer_token_length(cls, v: str) -> str:
+        """Ensure bearer token meets minimum length to resist brute force."""
+        if len(v) < 32:
+            raise ValueError(
+                "BEARER_TOKEN must be at least 32 characters long for security. "
+                "Use a strong, randomly generated token."
+            )
+        return v
+
     @field_validator('TARGET_MCP_URL', mode='before')
     @classmethod
     def validate_target_url(cls, v: str) -> str:

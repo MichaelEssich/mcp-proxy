@@ -7,6 +7,7 @@ to a target MCP server with bearer token authentication.
 
 import asyncio
 import hmac
+import inspect
 import ipaddress
 import logging
 import re
@@ -271,6 +272,7 @@ class ProxyClient:
             "keep-alive",          # Hop-by-hop
             "proxy-connection",    # Non-standard hop-by-hop
             "proxy-authorization",  # Prevent credential leakage
+            "authorization",  # Always strip, even when AUTH_HEADER_NAME is custom
             self.config.AUTH_HEADER_NAME.lower(),
             "user-agent",       # Prevent client identification
             "referer",         # Prevent referral information leak
@@ -304,6 +306,7 @@ class MCPProxyApp:
             strict_content_type=False,  # Disable strict Content-Type checking for proxy
             docs_url=None,      # Disable Swagger UI docs
             openapi_url=None,  # Disable OpenAPI schema
+            redoc_url=None,   # Disable ReDoc docs
         )
         
         # Setup CORS
@@ -478,13 +481,15 @@ class MCPProxyApp:
             query_params = dict(request.query_params)
 
             # Bound concurrent in-flight requests AND body buffering to prevent
-            # memory exhaustion under load. The body is read inside the
-            # semaphore so the worst-case memory bound is
-            # MAX_CONCURRENT_REQUESTS x MAX_REQUEST_SIZE. Reading the body
-            # before acquiring the semaphore would allow an attacker to open
-            # many concurrent connections and buffer large bodies outside the
-            # limit.
-            async with self._concurrency_sem:
+            # memory exhaustion under load. The semaphore is held for the full
+            # duration of upstream response streaming — not just until headers
+            # arrive — so that slow clients cannot exceed the concurrency limit
+            # by opening many requests and reading responses slowly. Reading
+            # the body inside the semaphore bounds worst-case memory to
+            # MAX_CONCURRENT_REQUESTS x MAX_REQUEST_SIZE.
+            await self._concurrency_sem.acquire()
+            response_body = None
+            try:
                 # Read request body if present, enforcing size limit for
                 # chunked transfers or mismatched Content-Length values.
                 body = None
@@ -509,12 +514,38 @@ class MCPProxyApp:
                     query_params=query_params if query_params else None
                 )
 
-            # Remove headers that shouldn't be returned to client
-            filtered_headers = self._filter_response_headers(response_headers)
+                # Remove headers that shouldn't be returned to client
+                filtered_headers = self._filter_response_headers(response_headers)
+            except Exception:
+                # Close the upstream response if it was opened, to avoid
+                # leaking the connection when header filtering or body
+                # reading fails.
+                if response_body is not None:
+                    if inspect.isasyncgen(response_body):
+                        await response_body.aclose()
+                    elif hasattr(response_body, "close"):
+                        response_body.close()
+                self._concurrency_sem.release()
+                raise
 
-            # Stream the response back to the client
+            # Stream the response back to the client. The semaphore is
+            # released in the generator's finally block — after the upstream
+            # response body has been fully consumed or the client
+            # disconnected — so the concurrency limit covers the entire
+            # streaming duration.
+            async def _stream_and_release():
+                try:
+                    if inspect.isasyncgen(response_body):
+                        async for chunk in response_body:
+                            yield chunk
+                    else:
+                        for chunk in response_body:
+                            yield chunk
+                finally:
+                    self._concurrency_sem.release()
+
             return StreamingResponse(
-                content=response_body,
+                content=_stream_and_release(),
                 status_code=status_code,
                 headers=filtered_headers,
                 media_type=response_headers.get("content-type", "application/octet-stream")
@@ -550,8 +581,10 @@ class MCPProxyApp:
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        # Compare with configured token (constant-time comparison)
-        if not hmac.compare_digest(token, self.config.BEARER_TOKEN):
+        # Compare with configured token (constant-time comparison).
+        # Encode to bytes so non-ASCII tokens return 403 instead of raising
+        # TypeError (which would surface as a 500).
+        if not hmac.compare_digest(token.encode("utf-8"), self.config.BEARER_TOKEN.encode("utf-8")):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid or expired token",

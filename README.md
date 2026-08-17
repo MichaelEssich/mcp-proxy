@@ -116,7 +116,7 @@ Set environment variables in the `docker-compose.yml` file or via a `.env` file.
 | `PROXY_PORT` | Port to bind the proxy server | `8000` | No |
 | `TARGET_MCP_URL` | URL of the target MCP server | `http://localhost:8080` | No |
 | `TARGET_TIMEOUT` | Request timeout to target server (seconds) | `30` | No |
-| `BEARER_TOKEN` | Secret token for authentication | - | **Yes** |
+| `BEARER_TOKEN` | Secret token for authentication (min 32 chars) | - | **Yes** |
 | `AUTH_HEADER_NAME` | Header name for token | `Authorization` | No |
 | `DEBUG` | Enable debug mode | `false` | No |
 | `ALLOWED_ORIGINS` | CORS allowed origins (comma-separated or `*`) | `*` | No |
@@ -148,17 +148,19 @@ Client → [Bearer Token Auth] → MCP Proxy → Target MCP Server
 ## Security Considerations
 
 1. **HTTPS**: Use HTTPS in production with a valid SSL certificate. **This proxy does not provide HTTPS support! Use a separate HTTPS proxy!**
-2. **Token Security**: Always use strong, randomly generated tokens. Tokens are compared using constant-time comparison (hmac.compare_digest) to prevent timing attacks.
+2. **Token Security**: Always use strong, randomly generated tokens (minimum 32 characters, enforced at startup). Tokens are compared using constant-time comparison (hmac.compare_digest) to prevent timing attacks.
 3. **Network Security**: Restrict access to the proxy server
 4. **Rate Limiting**: Built-in rate limiting (100 requests/minute per IP address by default) via the `slowapi` library. Can be customized by modifying the `default_limits` parameter in the Limiter configuration.
 5. **Path Validation**: Built-in protection against path traversal attacks (`..` and `//`)
-6. **Header Filtering**: Sensitive headers are automatically filtered:
-   - `Authorization` (authentication token)
+6. **Header Filtering**: Sensitive headers are automatically filtered (both request and response directions):
+   - `Authorization` (authentication token — always stripped, even when `AUTH_HEADER_NAME` is custom)
    - `User-Agent` (client identification)
    - `Referer` (referral information)
    - `X-Forwarded-For`, `X-Real-IP` (IP forwarding)
    - `Via` (proxy chain disclosure)
    - `Host`, `Content-Length`, `Transfer-Encoding`
+   - `Cookie` / `Set-Cookie` (session leakage prevention)
+   - `Proxy-Authorization` (credential leakage prevention)
 7. **SSRF Protection**: HTTP redirects are disabled to prevent Server-Side Request Forgery
 8. **Request Size Limit**: Default 10MB limit prevents memory exhaustion attacks
 9. **Response Size Limit**: Upstream responses are capped at 50MB; oversized responses are rejected with 413

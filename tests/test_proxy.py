@@ -20,7 +20,7 @@ def mock_config():
         DEBUG=True,
         TARGET_MCP_URL="http://mock-mcp-server:8080",
         TARGET_TIMEOUT=5,
-        BEARER_TOKEN="test-token-123",
+        BEARER_TOKEN="test-token-1234567890123456789012",
         AUTH_HEADER_NAME="Authorization",
         ALLOWED_ORIGINS="*",
         PROXY_PREFIX="",
@@ -177,7 +177,7 @@ class TestMCPProxyApp:
         
         response = test_client.post(
             "/test-endpoint",
-            headers={"Authorization": "Bearer test-token-123"},
+            headers={"Authorization": "Bearer test-token-1234567890123456789012"},
             json={"data": "test"}
         )
         
@@ -187,7 +187,7 @@ class TestMCPProxyApp:
     def test_bearer_token_validation(self, mock_config, proxy_app):
         """Test bearer token validation."""
         # Test valid token
-        assert proxy_app._validate_bearer_token("test-token-123") is True
+        assert proxy_app._validate_bearer_token("test-token-1234567890123456789012") is True
 
         # Test invalid token
         with pytest.raises(Exception) as exc_info:
@@ -207,7 +207,7 @@ class TestConfiguration:
     
     def test_default_config(self):
         """Test default configuration values."""
-        config = ProxyConfig(BEARER_TOKEN="test")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012")
         assert config.PROXY_HOST == "127.0.0.1"
         assert config.PROXY_PORT == 8000
         assert config.TARGET_MCP_URL == "http://localhost:8080"
@@ -215,35 +215,35 @@ class TestConfiguration:
     def test_config_validation(self):
         """Test configuration validation."""
         # Test trailing slash removal from target URL
-        config = ProxyConfig(BEARER_TOKEN="test", TARGET_MCP_URL="http://localhost:8080/")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012", TARGET_MCP_URL="http://localhost:8080/")
         assert config.TARGET_MCP_URL == "http://localhost:8080"
         
         # Test proxy prefix normalization
-        config = ProxyConfig(BEARER_TOKEN="test", PROXY_PREFIX="/api/mcp/")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012", PROXY_PREFIX="/api/mcp/")
         assert config.PROXY_PREFIX == "/api/mcp"
         
-        config = ProxyConfig(BEARER_TOKEN="test", PROXY_PREFIX="api/mcp")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012", PROXY_PREFIX="api/mcp")
         assert config.PROXY_PREFIX == "/api/mcp"
     
     def test_allowed_origins_parsing(self):
         """Test allowed origins parsing."""
-        config = ProxyConfig(BEARER_TOKEN="test", ALLOWED_ORIGINS="http://localhost:3000,https://app.example.com")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012", ALLOWED_ORIGINS="http://localhost:3000,https://app.example.com")
         assert config.allowed_origins_list == ["http://localhost:3000", "https://app.example.com"]
         
-        config = ProxyConfig(BEARER_TOKEN="test", ALLOWED_ORIGINS="*")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012", ALLOWED_ORIGINS="*")
         assert config.allowed_origins_list == ["*"]
 
     def test_trusted_proxies_parsing(self):
         """Test trusted proxies parsing."""
-        config = ProxyConfig(BEARER_TOKEN="test")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012")
         assert config.trusted_proxies_list == []
 
-        config = ProxyConfig(BEARER_TOKEN="test", TRUSTED_PROXIES="172.16.0.0/12, 10.0.0.0/8")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012", TRUSTED_PROXIES="172.16.0.0/12, 10.0.0.0/8")
         assert config.trusted_proxies_list == ["172.16.0.0/12", "10.0.0.0/8"]
 
     def test_response_size_default(self):
         """Test that MAX_RESPONSE_SIZE has a default value."""
-        config = ProxyConfig(BEARER_TOKEN="test")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012")
         assert config.MAX_RESPONSE_SIZE == 50_000_000
 
 
@@ -267,7 +267,7 @@ class TestRequestSizeLimit:
         oversized_body = "x" * (proxy_app.config.MAX_REQUEST_SIZE + 1)
         response = test_client.post(
             "/test-endpoint",
-            headers={"Authorization": "Bearer test-token-123"},
+            headers={"Authorization": "Bearer test-token-1234567890123456789012"},
             content=oversized_body.encode(),
         )
         assert response.status_code == 413
@@ -286,7 +286,7 @@ class TestRequestSizeLimit:
             body = b"x" * 100  # Well under the 1MB limit
             response = test_client.post(
                 "/test-endpoint",
-                headers={"Authorization": "Bearer test-token-123"},
+                headers={"Authorization": "Bearer test-token-1234567890123456789012"},
                 content=body,
             )
             assert response.status_code == 200
@@ -297,7 +297,7 @@ class TestRequestSizeLimit:
         response = test_client.post(
             "/test-endpoint",
             headers={
-                "Authorization": "Bearer test-token-123",
+                "Authorization": "Bearer test-token-1234567890123456789012",
                 "Transfer-Encoding": "chunked",
             },
             content=oversized_body.encode(),
@@ -309,7 +309,7 @@ class TestRequestSizeLimit:
         response = test_client.post(
             "/test-endpoint",
             headers={
-                "Authorization": "Bearer test-token-123",
+                "Authorization": "Bearer test-token-1234567890123456789012",
                 "Content-Length": "-1",
             },
             content=b"x",
@@ -510,7 +510,7 @@ class TestRateLimiting:
 
         # Config with TRUSTED_PROXIES
         config = ProxyConfig(
-            BEARER_TOKEN="test",
+            BEARER_TOKEN="test-token-1234567890123456789012",
             TRUSTED_PROXIES="172.16.0.0/12, 10.0.0.0/8"
         )
         app2 = MCPProxyApp(config)
@@ -605,7 +605,7 @@ class TestResponseSizeLimit:
         """Test that response streaming aborts when MAX_RESPONSE_SIZE is exceeded."""
         import httpx2 as httpx
         config = ProxyConfig(
-            BEARER_TOKEN="test",
+            BEARER_TOKEN="test-token-1234567890123456789012",
             TARGET_MCP_URL="http://mock:8080",
             MAX_RESPONSE_SIZE=100,
         )
@@ -650,7 +650,7 @@ class TestResponseSizeLimit:
     async def test_oversized_upstream_content_length_rejected(self, mock_config):
         """Test that upstream Content-Length > MAX_RESPONSE_SIZE is rejected with 413."""
         config = ProxyConfig(
-            BEARER_TOKEN="test",
+            BEARER_TOKEN="test-token-1234567890123456789012",
             TARGET_MCP_URL="http://mock:8080",
             MAX_RESPONSE_SIZE=100,
         )
@@ -681,7 +681,7 @@ class TestCustomAuthHeader:
     def test_custom_auth_header_name(self):
         """Test that a custom AUTH_HEADER_NAME is read for auth."""
         config = ProxyConfig(
-            BEARER_TOKEN="my-secret",
+            BEARER_TOKEN="my-secret-token-12345678901234567890",
             AUTH_HEADER_NAME="X-Api-Key",
         )
         app = MCPProxyApp(config)
@@ -689,17 +689,17 @@ class TestCustomAuthHeader:
         from starlette.requests import Request
         scope = {
             "type": "http", "method": "GET", "path": "/x", "query_string": b"",
-            "headers": [(b"x-api-key", b"my-secret")],
+            "headers": [(b"x-api-key", b"my-secret-token-12345678901234567890")],
             "client": ("127.0.0.1", 12345),
         }
         token = app._extract_token(Request(scope))
-        assert token == "my-secret"
+        assert token == "my-secret-token-12345678901234567890"
         assert app._validate_bearer_token(token) is True
 
     def test_custom_auth_header_ignored_when_standard_used(self):
         """Test that Authorization header is not read when AUTH_HEADER_NAME is custom."""
         config = ProxyConfig(
-            BEARER_TOKEN="my-secret",
+            BEARER_TOKEN="my-secret-token-12345678901234567890",
             AUTH_HEADER_NAME="X-Api-Key",
         )
         app = MCPProxyApp(config)
@@ -707,7 +707,7 @@ class TestCustomAuthHeader:
         from starlette.requests import Request
         scope = {
             "type": "http", "method": "GET", "path": "/x", "query_string": b"",
-            "headers": [(b"authorization", b"Bearer my-secret")],
+            "headers": [(b"authorization", b"Bearer my-secret-token-12345678901234567890")],
             "client": ("127.0.0.1", 12345),
         }
         token = app._extract_token(Request(scope))
@@ -720,11 +720,11 @@ class TestCustomAuthHeader:
         from starlette.requests import Request
         scope = {
             "type": "http", "method": "GET", "path": "/x", "query_string": b"",
-            "headers": [(b"authorization", b"Bearer test-token-123")],
+            "headers": [(b"authorization", b"Bearer test-token-1234567890123456789012")],
             "client": ("127.0.0.1", 12345),
         }
         token = app._extract_token(Request(scope))
-        assert token == "test-token-123"
+        assert token == "test-token-1234567890123456789012"
 
     def test_malformed_bearer_returns_none(self, mock_config):
         """Test that a malformed Bearer header returns None (-> 401)."""
@@ -745,7 +745,7 @@ class TestRealIpHeaderDefault:
 
     def test_default_real_ip_header_is_cf(self):
         """Test that REAL_IP_HEADER defaults to cf-connecting-ip."""
-        config = ProxyConfig(BEARER_TOKEN="test")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012")
         assert config.REAL_IP_HEADER == "cf-connecting-ip"
 
     def test_nginx_spoofed_cf_connecting_ip_ignored(self):
@@ -781,13 +781,13 @@ class TestConcurrencyLimit:
 
     def test_concurrency_semaphore_created(self):
         """Test that the concurrency semaphore is initialized."""
-        config = ProxyConfig(BEARER_TOKEN="test", MAX_CONCURRENT_REQUESTS=5)
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012", MAX_CONCURRENT_REQUESTS=5)
         app = MCPProxyApp(config)
         assert app._concurrency_sem._value == 5
 
     def test_default_concurrency_limit(self):
         """Test that the default concurrency limit is 50."""
-        config = ProxyConfig(BEARER_TOKEN="test")
+        config = ProxyConfig(BEARER_TOKEN="test-token-1234567890123456789012")
         assert config.MAX_CONCURRENT_REQUESTS == 50
 
 
@@ -807,7 +807,7 @@ class TestBodyReadInsideSemaphore:
         from unittest.mock import AsyncMock, patch
 
         config = ProxyConfig(
-            BEARER_TOKEN="test",
+            BEARER_TOKEN="test-token-1234567890123456789012",
             MAX_CONCURRENT_REQUESTS=1,
             MAX_REQUEST_SIZE=100000,
         )
@@ -828,7 +828,7 @@ class TestBodyReadInsideSemaphore:
             tc = TestClient(client)
             response = tc.post(
                 "/test",
-                headers={"Authorization": "Bearer test"},
+                headers={"Authorization": "Bearer test-token-1234567890123456789012"},
                 content=b"x" * 100,
             )
             assert response.status_code == 200
@@ -847,7 +847,7 @@ class TestRateLimitCORS:
         from slowapi.errors import RateLimitExceeded
 
         config = ProxyConfig(
-            BEARER_TOKEN="test",
+            BEARER_TOKEN="test-token-1234567890123456789012",
             ALLOWED_ORIGINS="*",
         )
         app = MCPProxyApp(config)
@@ -873,7 +873,7 @@ class TestRateLimitCORS:
         from slowapi.errors import RateLimitExceeded
 
         config = ProxyConfig(
-            BEARER_TOKEN="test",
+            BEARER_TOKEN="test-token-1234567890123456789012",
             ALLOWED_ORIGINS="https://app.example.com",
         )
         app = MCPProxyApp(config)
@@ -909,7 +909,7 @@ class TestRateLimitCORS:
         from slowapi.errors import RateLimitExceeded
 
         config = ProxyConfig(
-            BEARER_TOKEN="test",
+            BEARER_TOKEN="test-token-1234567890123456789012",
             ALLOWED_ORIGINS="*",
         )
         app = MCPProxyApp(config)
@@ -927,3 +927,206 @@ class TestRateLimitCORS:
         response = handler(Request(scope), MagicMock())
         assert response.status_code == 429
         assert response.headers.get("access-control-allow-origin") is None
+
+
+class TestAuthorizationAlwaysStripped:
+    """Tests that Authorization is always stripped even with custom AUTH_HEADER_NAME."""
+
+    def test_authorization_stripped_with_custom_auth_header(self):
+        """Test that Authorization header is stripped even when AUTH_HEADER_NAME
+        is set to a custom header (e.g. X-Api-Key).
+
+        Previously, only the configured AUTH_HEADER_NAME was stripped, allowing
+        a client to authenticate via the custom header while injecting an
+        Authorization header to the upstream server.
+        """
+        config = ProxyConfig(
+            BEARER_TOKEN="test-token-1234567890123456789012",
+            AUTH_HEADER_NAME="X-Api-Key",
+        )
+        client = ProxyClient(config)
+
+        headers = {
+            "X-Api-Key": "test-token-1234567890123456789012",
+            "Authorization": "Bearer injected-upstream-cred",
+            "X-Custom-Header": "value",
+        }
+
+        filtered = client._filter_headers(headers)
+
+        assert "X-Api-Key" not in filtered
+        assert "Authorization" not in filtered
+        assert "X-Custom-Header" in filtered
+
+
+class TestRedocDisabled:
+    """Tests that the /redoc endpoint is disabled."""
+
+    def test_redoc_url_is_none(self, mock_config):
+        """Test that redoc_url is set to None in the FastAPI app."""
+        app = MCPProxyApp(mock_config)
+        fastapi_app = app.get_app()
+        assert fastapi_app.redoc_url is None
+
+    def test_docs_url_is_none(self, mock_config):
+        """Test that docs_url is set to None in the FastAPI app."""
+        app = MCPProxyApp(mock_config)
+        fastapi_app = app.get_app()
+        assert fastapi_app.docs_url is None
+
+    def test_openapi_url_is_none(self, mock_config):
+        """Test that openapi_url is set to None in the FastAPI app."""
+        app = MCPProxyApp(mock_config)
+        fastapi_app = app.get_app()
+        assert fastapi_app.openapi_url is None
+
+
+class TestNonAsciiToken:
+    """Tests that non-ASCII tokens return 403 instead of 500."""
+
+    def test_non_ascii_token_returns_403(self, mock_config):
+        """Test that a non-ASCII token returns 403, not 500.
+
+        hmac.compare_digest raises TypeError on non-ASCII strings. The fix
+        encodes to bytes first so non-ASCII tokens get a clean 403.
+        """
+        app = MCPProxyApp(mock_config)
+
+        from starlette.requests import Request
+        scope = {
+            "type": "http", "method": "GET", "path": "/x", "query_string": b"",
+            "headers": [(b"authorization", b"Bearer \xc3\xa9\xe2\x9c\x93")],
+            "client": ("127.0.0.1", 12345),
+        }
+        token = app._extract_token(Request(scope))
+        assert token is not None
+
+        # Should return False (403), not raise TypeError (500)
+        with pytest.raises(Exception) as exc_info:
+            app._validate_bearer_token(token)
+        assert "403" in str(exc_info.value.detail) or exc_info.value.status_code == 403
+
+
+class TestBearerTokenMinLength:
+    """Tests for BEARER_TOKEN minimum length validation."""
+
+    def test_short_token_rejected(self):
+        """Test that a BEARER_TOKEN shorter than 32 chars is rejected."""
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig(BEARER_TOKEN="short-token")
+        assert "at least 32 characters" in str(exc_info.value)
+
+    def test_32_char_token_accepted(self):
+        """Test that a 32-char BEARER_TOKEN is accepted."""
+        config = ProxyConfig(BEARER_TOKEN="a" * 32)
+        assert config.BEARER_TOKEN == "a" * 32
+
+    def test_long_token_accepted(self):
+        """Test that a long BEARER_TOKEN is accepted."""
+        config = ProxyConfig(BEARER_TOKEN="a" * 64)
+        assert config.BEARER_TOKEN == "a" * 64
+
+
+class TestSemaphoreHeldDuringStreaming:
+    """Tests that the concurrency semaphore is held during response streaming."""
+
+    def test_semaphore_released_after_streaming_completes(self):
+        """Test that the semaphore is released only after the response body
+        has been fully consumed, not just after forward_request returns.
+
+        We set MAX_CONCURRENT_REQUESTS=1 and mock forward_request to return
+        an async generator. The semaphore should be at 0 during streaming
+        and return to 1 after the stream is consumed.
+        """
+        import asyncio
+
+        config = ProxyConfig(
+            BEARER_TOKEN="test-token-1234567890123456789012",
+            MAX_CONCURRENT_REQUESTS=1,
+            MAX_REQUEST_SIZE=100000,
+        )
+        app = MCPProxyApp(config)
+
+        sem_values_during_stream = []
+
+        async def mock_forward(*args, **kwargs):
+            async def body_gen():
+                # While streaming, the semaphore should be held (value=0)
+                sem_values_during_stream.append(app._concurrency_sem._value)
+                yield b'{"ok": true}'
+
+            return (200, {"content-type": "application/json"}, body_gen())
+
+        with patch.object(app.proxy_client, 'forward_request', new_callable=AsyncMock) as mock:
+            mock.side_effect = mock_forward
+            from fastapi.testclient import TestClient
+            tc = TestClient(app.get_app())
+            response = tc.get(
+                "/test",
+                headers={"Authorization": "Bearer test-token-1234567890123456789012"},
+            )
+            assert response.status_code == 200
+            # Semaphore should have been 0 during streaming
+            assert sem_values_during_stream == [0], (
+                "Semaphore should be held (value=0) during streaming; "
+                f"got {sem_values_during_stream}"
+            )
+            # After streaming completes, semaphore should be released (value=1)
+            assert app._concurrency_sem._value == 1, (
+                "Semaphore should be released after streaming completes; "
+                f"got {app._concurrency_sem._value}"
+            )
+
+    def test_semaphore_released_on_forward_request_exception(self):
+        """Test that the semaphore is released when forward_request raises
+        an exception, preventing a deadlock."""
+        config = ProxyConfig(
+            BEARER_TOKEN="test-token-1234567890123456789012",
+            MAX_CONCURRENT_REQUESTS=1,
+            MAX_REQUEST_SIZE=100000,
+        )
+        app = MCPProxyApp(config)
+
+        async def mock_forward(*args, **kwargs):
+            raise Exception("upstream error")
+
+        with patch.object(app.proxy_client, 'forward_request', new_callable=AsyncMock) as mock:
+            mock.side_effect = mock_forward
+            from fastapi.testclient import TestClient
+            tc = TestClient(app.get_app(), raise_server_exceptions=False)
+            response = tc.get(
+                "/test",
+                headers={"Authorization": "Bearer test-token-1234567890123456789012"},
+            )
+            # Should get 500 error
+            assert response.status_code == 500
+            # Semaphore should be released after the exception
+            assert app._concurrency_sem._value == 1, (
+                "Semaphore should be released after forward_request exception; "
+                f"got {app._concurrency_sem._value}"
+            )
+
+    def test_semaphore_released_on_body_oversize_exception(self):
+        """Test that the semaphore is released when body reading raises 413."""
+        config = ProxyConfig(
+            BEARER_TOKEN="test-token-1234567890123456789012",
+            MAX_CONCURRENT_REQUESTS=1,
+            MAX_REQUEST_SIZE=100,
+        )
+        app = MCPProxyApp(config)
+
+        with patch.object(app.proxy_client, 'forward_request', new_callable=AsyncMock) as mock:
+            mock.return_value = (200, {"content-type": "application/json"}, iter([b"ok"]))
+            from fastapi.testclient import TestClient
+            tc = TestClient(app.get_app())
+            response = tc.post(
+                "/test",
+                headers={"Authorization": "Bearer test-token-1234567890123456789012"},
+                content=b"x" * 200,
+            )
+            assert response.status_code == 413
+            assert app._concurrency_sem._value == 1, (
+                "Semaphore should be released after body size exception; "
+                f"got {app._concurrency_sem._value}"
+            )

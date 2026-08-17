@@ -108,7 +108,7 @@ async def test_proxy_integration():
             PROXY_PORT=8001,
             DEBUG=True,
             TARGET_MCP_URL="http://127.0.0.1:8081",
-            BEARER_TOKEN="test-secret-token",
+            BEARER_TOKEN="test-secret-token-12345678901234567890",
             AUTH_HEADER_NAME="Authorization",
             ALLOWED_ORIGINS="*"
         )
@@ -158,7 +158,7 @@ async def test_proxy_integration():
             logger.info("Test 3: Valid token - GET request")
             response = await client.get(
                 f"{proxy_url}/endpoints",
-                headers={"Authorization": "Bearer test-secret-token"}
+                headers={"Authorization": "Bearer test-secret-token-12345678901234567890"}
             )
             assert response.status_code == 200
             data = response.json()
@@ -170,7 +170,7 @@ async def test_proxy_integration():
             response = await client.post(
                 f"{proxy_url}/process",
                 headers={
-                    "Authorization": "Bearer test-secret-token",
+                    "Authorization": "Bearer test-secret-token-12345678901234567890",
                     "Content-Type": "application/json"
                 },
                 json={"test": "data"}
@@ -184,7 +184,7 @@ async def test_proxy_integration():
             logger.info("Test 5: Stream response")
             response = await client.get(
                 f"{proxy_url}/stream",
-                headers={"Authorization": "Bearer test-secret-token"}
+                headers={"Authorization": "Bearer test-secret-token-12345678901234567890"}
             )
             assert response.status_code == 200
             text = response.text
@@ -203,7 +203,7 @@ async def test_proxy_integration():
             for i in range(101):
                 response = await client.get(
                     f"{proxy_url}/endpoints",
-                    headers={"Authorization": "Bearer test-secret-token"}
+                    headers={"Authorization": "Bearer test-secret-token-12345678901234567890"}
                 )
                 if response.status_code == 429:
                     rate_limited_count += 1
