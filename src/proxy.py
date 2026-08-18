@@ -46,6 +46,8 @@ _RESPONSE_HEADERS_TO_STRIP = {
     "x-runtime",
     "via",
     "set-cookie",
+    "location",          # Upstream may leak internal host:port in redirects
+    "content-location",  # Same — upstream-internal resource paths
     "access-control-allow-origin",
     "access-control-allow-credentials",
     "access-control-allow-methods",
@@ -272,8 +274,6 @@ class ProxyClient:
             "keep-alive",          # Hop-by-hop
             "proxy-connection",    # Non-standard hop-by-hop
             "proxy-authorization",  # Prevent credential leakage
-            "authorization",  # Always strip, even when AUTH_HEADER_NAME is custom
-            self.config.AUTH_HEADER_NAME.lower(),
             "user-agent",       # Prevent client identification
             "referer",         # Prevent referral information leak
             "x-forwarded-for", # Prevent IP forwarding (handle separately if needed)
@@ -281,7 +281,15 @@ class ProxyClient:
             "via",             # Prevent proxy chain disclosure
             "cookie",          # Prevent cookie/session leakage
         }
-        
+
+        # The auth header (Authorization or a custom AUTH_HEADER_NAME) is
+        # stripped by default to prevent leaking the proxy's secret to the
+        # upstream. When FORWARD_AUTH_HEADER is enabled, it is forwarded
+        # unchanged so the upstream MCP server receives the same bearer token.
+        if not self.config.FORWARD_AUTH_HEADER:
+            headers_to_remove.add("authorization")
+            headers_to_remove.add(self.config.AUTH_HEADER_NAME.lower())
+
         filtered = {}
         for key, value in headers.items():
             if key.lower() not in headers_to_remove:

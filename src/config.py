@@ -22,6 +22,10 @@ class ProxyConfig(BaseSettings):
     # Authentication settings
     BEARER_TOKEN: str = Field(..., description="Secret token for bearer authentication")
     AUTH_HEADER_NAME: str = "Authorization"
+    # When True, the auth header (Authorization or AUTH_HEADER_NAME) is forwarded
+    # to the upstream MCP server so it receives the same bearer token. Default is
+    # False to prevent leaking the proxy secret to the upstream.
+    FORWARD_AUTH_HEADER: bool = False
     
     # CORS settings
     ALLOWED_ORIGINS: str = "*"

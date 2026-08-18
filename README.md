@@ -118,6 +118,7 @@ Set environment variables in the `docker-compose.yml` file or via a `.env` file.
 | `TARGET_TIMEOUT` | Request timeout to target server (seconds) | `30` | No |
 | `BEARER_TOKEN` | Secret token for authentication (min 32 chars) | - | **Yes** |
 | `AUTH_HEADER_NAME` | Header name for token | `Authorization` | No |
+| `FORWARD_AUTH_HEADER` | Forward the auth header to the upstream MCP server | `false` | No |
 | `DEBUG` | Enable debug mode | `false` | No |
 | `ALLOWED_ORIGINS` | CORS allowed origins (comma-separated or `*`) | `*` | No |
 | `PROXY_PREFIX` | URL prefix for all proxy routes | `""` (empty) | No |
@@ -153,7 +154,7 @@ Client → [Bearer Token Auth] → MCP Proxy → Target MCP Server
 4. **Rate Limiting**: Built-in rate limiting (100 requests/minute per IP address by default) via the `slowapi` library. Can be customized by modifying the `default_limits` parameter in the Limiter configuration.
 5. **Path Validation**: Built-in protection against path traversal attacks (`..` and `//`)
 6. **Header Filtering**: Sensitive headers are automatically filtered (both request and response directions):
-   - `Authorization` (authentication token — always stripped, even when `AUTH_HEADER_NAME` is custom)
+   - `Authorization` (authentication token — stripped by default; set `FORWARD_AUTH_HEADER=true` to pass it to the upstream)
    - `User-Agent` (client identification)
    - `Referer` (referral information)
    - `X-Forwarded-For`, `X-Real-IP` (IP forwarding)

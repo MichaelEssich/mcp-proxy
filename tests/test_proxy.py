@@ -958,6 +958,48 @@ class TestAuthorizationAlwaysStripped:
         assert "Authorization" not in filtered
         assert "X-Custom-Header" in filtered
 
+    def test_auth_header_forwarded_when_enabled(self):
+        """Test that the auth header is forwarded when FORWARD_AUTH_HEADER=True."""
+        config = ProxyConfig(
+            BEARER_TOKEN="test-token-1234567890123456789012",
+            AUTH_HEADER_NAME="Authorization",
+            FORWARD_AUTH_HEADER=True,
+        )
+        client = ProxyClient(config)
+
+        headers = {
+            "Authorization": "Bearer test-token-1234567890123456789012",
+            "X-Custom-Header": "value",
+        }
+
+        filtered = client._filter_headers(headers)
+
+        assert "Authorization" in filtered
+        assert "X-Custom-Header" in filtered
+
+    def test_custom_auth_header_forwarded_when_enabled(self):
+        """Test that a custom auth header is forwarded when FORWARD_AUTH_HEADER=True."""
+        config = ProxyConfig(
+            BEARER_TOKEN="test-token-1234567890123456789012",
+            AUTH_HEADER_NAME="X-Api-Key",
+            FORWARD_AUTH_HEADER=True,
+        )
+        client = ProxyClient(config)
+
+        headers = {
+            "X-Api-Key": "test-token-1234567890123456789012",
+            "Authorization": "Bearer other-cred",
+            "X-Custom-Header": "value",
+        }
+
+        filtered = client._filter_headers(headers)
+
+        assert "X-Api-Key" in filtered
+        # Authorization is still forwarded too when enabled, since the client
+        # may have sent both
+        assert "Authorization" in filtered
+        assert "X-Custom-Header" in filtered
+
 
 class TestRedocDisabled:
     """Tests that the /redoc endpoint is disabled."""
